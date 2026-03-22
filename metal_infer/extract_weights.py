@@ -59,12 +59,13 @@ def main():
     # Load model config (from config.json in model directory)
     config_path = model_path / 'config.json'
     model_config = {}
+    quant_config = {}
     if config_path.exists():
         with open(config_path) as f:
-            model_config = json.load(f)
+            raw_config = json.load(f)
+        quant_config = raw_config.get('quantization_config', {})
         # Handle multimodal models where text config is nested
-        if 'text_config' in model_config:
-            model_config = model_config['text_config']
+        model_config = raw_config.get('text_config', raw_config)
         print(f"Loaded model config from {config_path}")
     else:
         print(f"WARNING: {config_path} not found, using defaults (Qwen3.5-397B)")
@@ -157,8 +158,8 @@ def main():
             "linear_conv_kernel_dim": model_config.get("linear_conv_kernel_dim", 4),
             "partial_rotary_factor": model_config.get("partial_rotary_factor", 0.25),
             "rope_theta": model_config.get("rope_theta", 10000000.0),
-            "group_size": 64,
-            "quantization_bits": 4,
+            "group_size": quant_config.get("group_size", 64),
+            "quantization_bits": quant_config.get("bits", 4),
         }
     }
 

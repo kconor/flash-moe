@@ -557,6 +557,70 @@ kernel void dequant_matvec_8bit(
     }
 }
 
+// 8-bit variant of matvec_fast (for in_dim > 4096, no shared memory cache)
+kernel void dequant_matvec_8bit_fast(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= out_dim) return;
+
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size / 4;
+    uint packed_cols = in_dim / 4;
+
+    device const uint32_t* w_row = W_packed + tgid * packed_cols;
+    device const uint16_t* s_row = scales + tgid * num_groups;
+    device const uint16_t* b_row = biases + tgid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = lid; g < num_groups; g += tg_size) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint base_packed = g * packed_per_group;
+        uint base_x = g * group_size;
+
+        for (uint p = 0; p < packed_per_group; p++) {
+            uint32_t packed = w_row[base_packed + p];
+            uint x_base = base_x + p * 4;
+
+            acc += fma(float((packed >>  0) & 0xFF), scale, bias) * x[x_base + 0];
+            acc += fma(float((packed >>  8) & 0xFF), scale, bias) * x[x_base + 1];
+            acc += fma(float((packed >> 16) & 0xFF), scale, bias) * x[x_base + 2];
+            acc += fma(float((packed >> 24) & 0xFF), scale, bias) * x[x_base + 3];
+        }
+    }
+
+    threadgroup float shared[32];
+    float simd_val = simd_sum(acc);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = shared[simd_lane];
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[tgid] = val;
+        }
+    }
+}
+
 
 // ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads

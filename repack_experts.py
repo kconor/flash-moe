@@ -254,13 +254,13 @@ def main():
     # Override layout from config if provided
     if args.config:
         with open(args.config) as f:
-            cfg = json.load(f)
-        if 'text_config' in cfg:
-            cfg = cfg['text_config']
+            raw_cfg = json.load(f)
+        qcfg = raw_cfg.get("quantization_config", {})
+        cfg = raw_cfg.get("text_config", raw_cfg)
         HIDDEN_DIM = cfg.get("hidden_size", HIDDEN_DIM)
         MOE_INTERMEDIATE = cfg.get("moe_intermediate_size", MOE_INTERMEDIATE)
-        GROUP_SIZE = cfg.get("group_size", GROUP_SIZE)
-        BITS = cfg.get("quantization_bits", BITS)
+        GROUP_SIZE = qcfg.get("group_size", cfg.get("group_size", GROUP_SIZE))
+        BITS = qcfg.get("bits", cfg.get("quantization_bits", BITS))
         NUM_EXPERTS = cfg.get("num_experts", NUM_EXPERTS)
         NUM_LAYERS = cfg.get("num_hidden_layers", NUM_LAYERS)
         COMPONENTS, EXPERT_SIZE = compute_expert_layout(HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS)

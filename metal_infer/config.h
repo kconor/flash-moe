@@ -62,6 +62,12 @@ typedef struct {
     int group_size;
     int bits;                   // default quantization (4, 8, etc.)
 
+    // Special tokens (model-dependent)
+    int eos_token_1;
+    int eos_token_2;
+    int think_start_token;
+    int think_end_token;
+
     // Expert binary layout — primary quantization (cfg->bits)
     size_t expert_size;
     size_t gate_w_off, gate_w_size;
@@ -195,6 +201,10 @@ static inline ModelConfig *model_config_default(void) {
     cfg->partial_rotary = 0.25f;
     cfg->group_size = 64;
     cfg->bits = 4;
+    cfg->eos_token_1 = 248046;
+    cfg->eos_token_2 = 248044;
+    cfg->think_start_token = 248068;
+    cfg->think_end_token = 248069;
     model_config_compute(cfg);
     return cfg;
 }
@@ -219,6 +229,12 @@ static inline ModelConfig *model_config_default(void) {
 #define FULL_ATTN_INTERVAL  (g_cfg->full_attn_interval)
 #define GROUP_SIZE          (g_cfg->group_size)
 #define BITS                (g_cfg->bits)
+
+// Special tokens
+#define EOS_TOKEN_1         (g_cfg->eos_token_1)
+#define EOS_TOKEN_2         (g_cfg->eos_token_2)
+#define THINK_START_TOKEN   (g_cfg->think_start_token)
+#define THINK_END_TOKEN     (g_cfg->think_end_token)
 
 // Linear attention
 #define LINEAR_NUM_V_HEADS  (g_cfg->linear_num_v_heads)
