@@ -1,9 +1,11 @@
-#!/usr/bin/env python3
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.9"
+# ///
 """Repack expert weights from scattered safetensors into contiguous per-layer binary files.
 
 Creates one binary file per layer: packed_experts/layer_XX.bin
-Each file = 512 experts x 7,077,888 bytes = ~3.63 GB
-Expert E starts at byte offset E * 7,077,888
+Expert E starts at byte offset E * EXPERT_SIZE
 
 Within each expert block, 9 components packed in fixed order:
   gate_proj.weight, gate_proj.scales, gate_proj.biases,
@@ -24,29 +26,49 @@ import os
 import time
 import sys
 
-# Component order and expected sizes
-COMPONENTS = [
-    {"name": "gate_proj.weight",  "offset": 0,       "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "gate_proj.scales",  "offset": 2097152,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "gate_proj.biases",  "offset": 2228224,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.weight",    "offset": 2359296,  "size": 2097152, "dtype": "U32", "shape": [1024, 512]},
-    {"name": "up_proj.scales",    "offset": 4456448,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "up_proj.biases",    "offset": 4587520,  "size": 131072,  "dtype": "BF16", "shape": [1024, 64]},
-    {"name": "down_proj.weight",  "offset": 4718592,  "size": 2097152, "dtype": "U32", "shape": [4096, 128]},
-    {"name": "down_proj.scales",  "offset": 6815744,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-    {"name": "down_proj.biases",  "offset": 6946816,  "size": 131072,  "dtype": "BF16", "shape": [4096, 16]},
-]
+def compute_expert_layout(hidden_dim, moe_intermediate, group_size, bits):
+    """Compute expert component layout from model dimensions."""
+    epk = 32 // bits  # elements per packed uint32
 
-EXPERT_SIZE = 7077888   # bytes per expert
+    # gate/up: [mid, in_dim] -> packed [mid, in_dim/epk] uint32
+    w_size = moe_intermediate * (hidden_dim // epk) * 4
+    # scales/biases: [mid, in_dim/gs] bf16
+    sb_size = moe_intermediate * (hidden_dim // group_size) * 2
+
+    # down: [in_dim, mid] -> packed [in_dim, mid/epk] uint32
+    dw_size = hidden_dim * (moe_intermediate // epk) * 4
+    dsb_size = hidden_dim * (moe_intermediate // group_size) * 2
+
+    off = 0
+    components = []
+    for name, sz in [("gate_proj.weight", w_size), ("gate_proj.scales", sb_size), ("gate_proj.biases", sb_size),
+                     ("up_proj.weight", w_size), ("up_proj.scales", sb_size), ("up_proj.biases", sb_size),
+                     ("down_proj.weight", dw_size), ("down_proj.scales", dsb_size), ("down_proj.biases", dsb_size)]:
+        dtype = "U32" if "weight" in name else "BF16"
+        components.append({"name": name, "offset": off, "size": sz, "dtype": dtype})
+        off += sz
+
+    return components, off
+
+
+# Default layout (Qwen3.5-397B-A17B, 4-bit)
+HIDDEN_DIM = 4096
+MOE_INTERMEDIATE = 1024
+GROUP_SIZE = 64
+BITS = 4
 NUM_EXPERTS = 512
 NUM_LAYERS = 60
-LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE  # 3,623,878,656 bytes (~3.63 GB)
+
+COMPONENTS, EXPERT_SIZE = compute_expert_layout(HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS)
+LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
 
 
-def parse_layers(spec):
+def parse_layers(spec, num_layers=None):
     """Parse layer specification like '0-4' or '0,5,10' or 'all'."""
+    if num_layers is None:
+        num_layers = NUM_LAYERS
     if spec is None or spec == 'all':
-        return list(range(NUM_LAYERS))
+        return list(range(num_layers))
     layers = []
     for part in spec.split(','):
         part = part.strip()
@@ -173,7 +195,8 @@ def verify_layer(layer_idx, expert_reads, model_path, fds, output_dir):
     fd_packed = os.open(out_path, os.O_RDONLY)
 
     mismatches = 0
-    for expert_idx in [0, 1, 255, 511]:  # spot check several experts
+    spot_check = [0, 1, NUM_EXPERTS // 2, NUM_EXPERTS - 1]
+    for expert_idx in spot_check:  # spot check several experts
         for comp in COMPONENTS:
             info = layer_info[comp['name']]
             src_fd = fds[info['file']]
@@ -212,9 +235,14 @@ def write_layout(output_dir):
 
 
 def main():
+    global COMPONENTS, EXPERT_SIZE, NUM_EXPERTS, NUM_LAYERS, LAYER_SIZE
+    global HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS
+
     parser = argparse.ArgumentParser(description="Repack expert weights into contiguous per-layer binary files")
     parser.add_argument('--index', default='/Users/danielwoods/Workspace/ane-research/expert_index.json',
                         help='Path to expert_index.json')
+    parser.add_argument('--config', default=None,
+                        help='Path to model config.json (auto-detect dimensions)')
     parser.add_argument('--layers', default=None,
                         help='Layer spec: "all", "0-4", "0,5,10" (default: all)')
     parser.add_argument('--dry-run', action='store_true',
@@ -222,6 +250,24 @@ def main():
     parser.add_argument('--verify-only', type=int, default=None, metavar='LAYER',
                         help='Verify a specific layer against originals')
     args = parser.parse_args()
+
+    # Override layout from config if provided
+    if args.config:
+        with open(args.config) as f:
+            cfg = json.load(f)
+        if 'text_config' in cfg:
+            cfg = cfg['text_config']
+        HIDDEN_DIM = cfg.get("hidden_size", HIDDEN_DIM)
+        MOE_INTERMEDIATE = cfg.get("moe_intermediate_size", MOE_INTERMEDIATE)
+        GROUP_SIZE = cfg.get("group_size", GROUP_SIZE)
+        BITS = cfg.get("quantization_bits", BITS)
+        NUM_EXPERTS = cfg.get("num_experts", NUM_EXPERTS)
+        NUM_LAYERS = cfg.get("num_hidden_layers", NUM_LAYERS)
+        COMPONENTS, EXPERT_SIZE = compute_expert_layout(HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS)
+        LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+        print(f"Config: hidden={HIDDEN_DIM}, intermediate={MOE_INTERMEDIATE}, "
+              f"experts={NUM_EXPERTS}, layers={NUM_LAYERS}, bits={BITS}")
+        print(f"Expert size: {EXPERT_SIZE} bytes")
 
     print("Loading expert index...")
     expert_reads, model_path = load_index(args.index)
