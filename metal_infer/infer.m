@@ -959,7 +959,8 @@ static void cpu_conv1d_step(
         // Process new input (last position in kernel)
         float w = bf16_to_f32(weight_bf16[c * kernel_size + (kernel_size - 1)]);
         acc += new_input[c] * w;
-        out[c] = acc;
+        // SiLU activation (matching GPU kernel and reference implementation)
+        out[c] = acc / (1.0f + expf(-acc));
     }
     // Apply SiLU
     cpu_silu(out, channels);
@@ -4803,14 +4804,45 @@ static void fused_layer_forward(
             int qkv_dim = LINEAR_CONV_DIM;
             int z_dim_l = LINEAR_TOTAL_VALUE;
 
-            // Split fused projection outputs if needed
+            // De-interleave fused projection outputs if needed.
+            // The fused in_proj_qkvz output is interleaved per k_head group:
+            //   [q0(hkd), k0(hkd), v0..v_{vpk-1}(vpk*hvd), z0..z_{vpk-1}(vpk*hvd)] × num_k_heads
+            // We need sequential: [all_q, all_k, all_v] + separate [all_z]
             if (lc->fused_qkvz && qkv_out) {
-                // qkv_out contains [qkv_dim | z_dim] concatenated
-                memcpy(z_out, qkv_out + qkv_dim, z_dim_l * sizeof(float));
+                int nk = LINEAR_NUM_K_HEADS;
+                int hkd = LINEAR_KEY_DIM;
+                int vpk = LINEAR_NUM_V_HEADS / nk;  // v_heads per k_head
+                int hvd = LINEAR_VALUE_DIM;
+                int per_group = hkd + hkd + vpk * hvd + vpk * hvd;
+                // Temporary buffer for de-interleaved output
+                float *tmp_qkv = s_conv_out;  // reuse scratch (same size as qkv_dim)
+                float *tmp_z = z_out;
+                for (int h = 0; h < nk; h++) {
+                    float *src = qkv_out + h * per_group;
+                    // q_h → sequential q block
+                    memcpy(tmp_qkv + h * hkd, src, hkd * sizeof(float));
+                    // k_h → sequential k block
+                    memcpy(tmp_qkv + nk * hkd + h * hkd, src + hkd, hkd * sizeof(float));
+                    // v heads → sequential v block
+                    memcpy(tmp_qkv + 2 * nk * hkd + h * vpk * hvd, src + 2 * hkd, vpk * hvd * sizeof(float));
+                    // z heads → z_out
+                    memcpy(tmp_z + h * vpk * hvd, src + 2 * hkd + vpk * hvd, vpk * hvd * sizeof(float));
+                }
+                // Copy de-interleaved qkv back to qkv_out
+                memcpy(qkv_out, tmp_qkv, qkv_dim * sizeof(float));
             }
             if (lc->fused_ba && beta_out) {
-                // beta_out contains [beta | alpha] concatenated
-                memcpy(alpha_out, beta_out + LINEAR_NUM_V_HEADS, LINEAR_NUM_V_HEADS * sizeof(float));
+                // De-interleave: [b0,b1,a0,a1, b2,b3,a2,a3, ...] → [all_b] + [all_a]
+                int nk = LINEAR_NUM_K_HEADS;
+                int vpk = LINEAR_NUM_V_HEADS / nk;
+                float tmp_b[LINEAR_NUM_V_HEADS], tmp_a[LINEAR_NUM_V_HEADS];
+                for (int h = 0; h < nk; h++) {
+                    float *src = beta_out + h * 2 * vpk;
+                    memcpy(tmp_b + h * vpk, src, vpk * sizeof(float));
+                    memcpy(tmp_a + h * vpk, src + vpk, vpk * sizeof(float));
+                }
+                memcpy(beta_out, tmp_b, LINEAR_NUM_V_HEADS * sizeof(float));
+                memcpy(alpha_out, tmp_a, LINEAR_NUM_V_HEADS * sizeof(float));
             }
 
             // Conv1d step
