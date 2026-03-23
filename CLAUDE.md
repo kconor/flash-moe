@@ -145,3 +145,6 @@ This is a primary development machine. The engine explicitly controls memory:
 - Total: ~6GB, leaving 42GB for OS + page cache
 - No OOM risk. Expert data streams from SSD on demand.
 - No custom caches. Trust the OS.
+
+## Running Experiments
+read experiements/status.md for additional instructions
