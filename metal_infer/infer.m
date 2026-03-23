@@ -769,20 +769,6 @@ static void cpu_dequant_matvec_bits(
     const float *x, float *out,
     int out_dim, int in_dim, int group_size, int bits
 ) {
-    if (bits == 16) {
-        // BF16: raw weights, no dequant
-        const uint16_t *W_bf16 = (const uint16_t *)W;
-        for (int row = 0; row < out_dim; row++) {
-            float acc = 0.0f;
-            const uint16_t *w_row = W_bf16 + (size_t)row * in_dim;
-            for (int col = 0; col < in_dim; col++) {
-                acc += bf16_to_f32(w_row[col]) * x[col];
-            }
-            out[row] = acc;
-        }
-        return;
-    }
-
     int num_groups = in_dim / group_size;
     int vals_per_u32 = 32 / bits;
     int packed_per_group = group_size / vals_per_u32;
@@ -998,8 +984,6 @@ typedef struct {
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_8bit;  // 8-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_8bit_fast; // 8-bit for in_dim > 4096
-    id<MTLComputePipelineState> matvec_bf16;      // BF16 (no quantization)
-    id<MTLComputePipelineState> matvec_bf16_fast; // BF16 for in_dim > 4096
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1140,8 +1124,6 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->matvec_8bit      = makePipe(@"dequant_matvec_8bit");
     ctx->matvec_8bit_fast = makePipe(@"dequant_matvec_8bit_fast");
-    ctx->matvec_bf16      = makePipe(@"matvec_bf16");
-    ctx->matvec_bf16_fast = makePipe(@"matvec_bf16_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1343,7 +1325,6 @@ static void reset_delta_net_state(void) {
 // Select the correct dequant pipeline based on active quantization
 static inline id<MTLComputePipelineState> expert_dequant_pipe(MetalCtx *ctx) {
     if (g_use_2bit) return ctx->matvec_2bit;
-    if (g_cfg->bits == 16) return ctx->matvec_bf16;
     if (g_cfg->bits == 8) return ctx->matvec_8bit;
     return ctx->matvec_v3;  // 4-bit default
 }
@@ -1407,9 +1388,7 @@ static void gpu_dequant_matvec(
     // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
     int use_small = (in_dim <= 4096);
     id<MTLComputePipelineState> pipe;
-    if (g_cfg->bits == 16)
-        pipe = use_small ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
-    else if (g_cfg->bits == 8)
+    if (g_cfg->bits == 8)
         pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
     else
         pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
@@ -1497,9 +1476,7 @@ static void gpu_batch_matvec(
         int spec_bits = s->bits > 0 ? s->bits : g_cfg->bits;
         int use_small = (s->in_dim <= 4096);
         id<MTLComputePipelineState> mv_pipe;
-        if (spec_bits == 16)
-            mv_pipe = use_small ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
-        else if (spec_bits == 8)
+        if (spec_bits == 8)
             mv_pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
         else
             mv_pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
@@ -1559,9 +1536,7 @@ static void gpu_encode_batch_matvec(
         int spec_bits = s->bits > 0 ? s->bits : g_cfg->bits;
         int use_small = (s->in_dim <= 4096);
         id<MTLComputePipelineState> mv_pipe;
-        if (spec_bits == 16)
-            mv_pipe = use_small ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
-        else if (spec_bits == 8)
+        if (spec_bits == 8)
             mv_pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
         else
             mv_pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
@@ -1614,9 +1589,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
     int use_small = (in_dim <= 4096);
     id<MTLComputePipelineState> pipe;
-    if (g_cfg->bits == 16)
-        pipe = use_small ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
-    else if (g_cfg->bits == 8)
+    if (g_cfg->bits == 8)
         pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
     else
         pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
@@ -3034,20 +3007,10 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
-    if (g_cfg->bits == 16) {
-        // BF16: raw weights, no dequant
-        const uint16_t *w_bf16 = (const uint16_t *)W;
-        const uint16_t *row = w_bf16 + (size_t)token_id * HIDDEN_DIM;
-        for (int i = 0; i < HIDDEN_DIM; i++) {
-            out[i] = bf16_to_f32(row[i]);
-        }
-        return;
-    }
-
     int group_size = HIDDEN_DIM / num_groups;
-    int vals_per_u32 = 32 / g_cfg->bits;
+    int vals_per_u32 = 32 / g_cfg->bits;          // 8 for 4-bit, 4 for 8-bit
     int packed_per_group = group_size / vals_per_u32;
-    uint32_t mask = (1u << g_cfg->bits) - 1;
+    uint32_t mask = (1u << g_cfg->bits) - 1;       // 0xF for 4-bit, 0xFF for 8-bit
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
@@ -5200,8 +5163,7 @@ static void fused_layer_forward(
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
-            [enc setComputePipelineState:(g_cfg->bits == 16) ? g_metal->matvec_bf16_fast :
-                                        (g_cfg->bits == 8)  ? g_metal->matvec_8bit_fast : g_metal->matvec_fast];
+            [enc setComputePipelineState:(g_cfg->bits == 8) ? g_metal->matvec_8bit_fast : g_metal->matvec_fast];
             [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
             [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
             [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];

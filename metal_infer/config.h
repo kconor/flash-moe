@@ -102,28 +102,6 @@ static inline void compute_expert_layout_bits(
 ) {
     int in_dim = hidden_dim;
     int mid = moe_intermediate;
-
-    if (bits == 16) {
-        // BF16: raw weights, no scales/biases
-        // gate/up: [mid, in_dim] bf16
-        size_t w_size = (size_t)mid * in_dim * sizeof(uint16_t);
-        // down: [in_dim, mid] bf16
-        size_t dw_size_ = (size_t)in_dim * mid * sizeof(uint16_t);
-
-        size_t off = 0;
-        *gw_off = off; *gw_sz = w_size;  off += w_size;
-        *gs_off = off; *gs_sz = 0;
-        *gb_off = off; *gb_sz = 0;
-        *uw_off = off; *uw_sz = w_size;  off += w_size;
-        *us_off = off; *us_sz = 0;
-        *ub_off = off; *ub_sz = 0;
-        *dw_off = off; *dw_sz = dw_size_; off += dw_size_;
-        *ds_off = off; *ds_sz = 0;
-        *db_off = off; *db_sz = 0;
-        *out_expert_size = off;
-        return;
-    }
-
     int gs = group_size;
     int epk = 32 / bits;  // elements per packed uint32
 

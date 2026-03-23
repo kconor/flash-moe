@@ -28,19 +28,6 @@ import sys
 
 def compute_expert_layout(hidden_dim, moe_intermediate, group_size, bits):
     """Compute expert component layout from model dimensions."""
-    if bits == 16:
-        # BF16: raw weights, no scales/biases
-        w_size = moe_intermediate * hidden_dim * 2  # [mid, in_dim] bf16
-        dw_size = hidden_dim * moe_intermediate * 2  # [in_dim, mid] bf16
-        off = 0
-        components = []
-        for name, sz in [("gate_proj.weight", w_size),
-                         ("up_proj.weight", w_size),
-                         ("down_proj.weight", dw_size)]:
-            components.append({"name": name, "offset": off, "size": sz, "dtype": "BF16"})
-            off += sz
-        return components, off
-
     epk = 32 // bits  # elements per packed uint32
 
     # gate/up: [mid, in_dim] -> packed [mid, in_dim/epk] uint32
