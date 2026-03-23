@@ -5544,11 +5544,37 @@ static void fused_layer_forward(
         memcpy([g_metal->buf_shared_up contents], shared_up,
                SHARED_INTERMEDIATE * sizeof(float));
 
-        // Wait for all async preads to complete
+        // ---- Per-expert CMD: submit GPU work as each pread completes ----
+        // Each expert gets its own command buffer, committed immediately.
+        // GPU starts processing cached experts while cold ones still read from SSD.
+        // The combine CMD (cmd_experts below) runs after all per-expert CMDs
+        // due to Metal command queue serialization.
         if (!pred_started && g_async_pread.active) {
-            async_pread_wait();
+            int encoded[MAX_K] = {0};
+            int num_encoded = 0;
+            while (num_encoded < actual_K) {
+                for (int k = 0; k < actual_K; k++) {
+                    if (encoded[k]) continue;
+                    if (!g_async_pread.ready[k]) continue;
+                    valid[k] = g_async_pread.valid[k];
+                    if (valid[k]) {
+                        id<MTLCommandBuffer> cmd_k = [g_metal->queue commandBuffer];
+                        gpu_encode_expert_forward_slot_buf(g_metal, cmd_k, k, expert_bufs[k]);
+                        [cmd_k commit];
+                    }
+                    encoded[k] = 1;
+                    num_encoded++;
+                }
+            }
+            g_async_pread.active = 0;
+        } else {
+            // All experts already loaded (cache/prediction path)
             for (int k = 0; k < actual_K; k++) {
-                valid[k] = g_async_pread.valid[k];
+                if (valid[k]) {
+                    id<MTLCommandBuffer> cmd_k = [g_metal->queue commandBuffer];
+                    gpu_encode_expert_forward_slot_buf(g_metal, cmd_k, k, expert_bufs[k]);
+                    [cmd_k commit];
+                }
             }
         }
 
@@ -5567,10 +5593,9 @@ static void fused_layer_forward(
 
         if (g_timing_enabled) { t0 = now_ms(); }
 
-        // Step 3: encode ALL experts + shared expert into ONE command buffer.
+        // Step 3: Combine CMD — runs after all per-expert CMDs (queue serialization).
+        // Contains shared expert + combine + residual + norm.
         id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
-
-        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
