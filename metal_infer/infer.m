@@ -3186,7 +3186,7 @@ typedef struct {
     InferPreadTask tasks[MAX_K];
     int num_tasks;
     int valid[MAX_K];
-    volatile int ready[MAX_K];  // per-expert completion flag
+    volatile int ready[MAX_K];  // per-expert completion flag (set by GCD block)
     dispatch_group_t group;
     int active;
 } AsyncPreadState;
@@ -3227,6 +3227,9 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
 static void async_pread_wait(void) {
     if (!g_async_pread.active) return;
     dispatch_group_wait(g_async_pread.group, DISPATCH_TIME_FOREVER);
+    for (int k = 0; k < g_async_pread.num_tasks; k++) {
+        g_async_pread.valid[k] = (g_async_pread.tasks[k].result == (ssize_t)active_expert_size());
+    }
     g_async_pread.active = 0;
 }
 
@@ -5541,31 +5544,15 @@ static void fused_layer_forward(
         memcpy([g_metal->buf_shared_up contents], shared_up,
                SHARED_INTERMEDIATE * sizeof(float));
 
-        // ---- Progressive encoding: encode experts into CMD3 as each pread completes ----
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; t0 = t1; }
-
-        id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
-
+        // Wait for all async preads to complete
         if (!pred_started && g_async_pread.active) {
-            // Progressively encode experts as they become ready
-            int encoded[MAX_K] = {0};
-            int num_encoded = 0;
-            while (num_encoded < actual_K) {
-                for (int k = 0; k < actual_K; k++) {
-                    if (encoded[k]) continue;
-                    if (!g_async_pread.ready[k]) continue;
-                    valid[k] = g_async_pread.valid[k];
-                    if (valid[k]) {
-                        gpu_encode_expert_forward_slot_buf(g_metal, cmd_experts, k, expert_bufs[k]);
-                    }
-                    encoded[k] = 1;
-                    num_encoded++;
-                }
+            async_pread_wait();
+            for (int k = 0; k < actual_K; k++) {
+                valid[k] = g_async_pread.valid[k];
             }
-            g_async_pread.active = 0;
-        } else {
-            gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
         }
+
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
 
         // Store this layer's routing for next token's temporal prediction.
         if (g_pred_enabled && g_pred_generating) {
@@ -5577,6 +5564,13 @@ static void fused_layer_forward(
                 g_pred_valid = 1;
             }
         }
+
+        if (g_timing_enabled) { t0 = now_ms(); }
+
+        // Step 3: encode ALL experts + shared expert into ONE command buffer.
+        id<MTLCommandBuffer> cmd_experts = [g_metal->queue commandBuffer];
+
+        gpu_encode_experts_batched(g_metal, cmd_experts, actual_K, valid, expert_bufs);
 
         // Shared expert SwiGLU + down_proj (2 more encoders)
         // Note: shared_gate/up already copied to GPU buffers above (before async pread wait)
