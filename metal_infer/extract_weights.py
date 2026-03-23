@@ -159,7 +159,7 @@ def main():
             "partial_rotary_factor": model_config.get("partial_rotary_factor", 0.25),
             "rope_theta": model_config.get("rope_theta", 10000000.0),
             "group_size": quant_config.get("group_size", 64),
-            "quantization_bits": quant_config.get("bits", 4),
+            "quantization_bits": quant_config.get("bits", 16 if not quant_config else 4),
         }
     }
 
