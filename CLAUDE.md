@@ -19,13 +19,21 @@ The entire 209GB model streams from SSD through a custom Metal compute pipeline.
 
 *2-bit quantization produces `\name\` instead of `"name"` in JSON output, making tool calling unreliable. 4-bit is the production configuration.
 
-## Hardware
+## Original Hardware for paper:
 
 - **Machine**: MacBook Pro, Apple M3 Max
 - **Chip**: 16-core CPU (12P + 4E), 40-core GPU, 16-core ANE
 - **Memory**: 48 GB unified (~400 GB/s bandwidth)
 - **SSD**: 1TB Apple Fabric, **17.5 GB/s sequential read** (measured)
 - **macOS**: 26.2 (Darwin 25.2.0)
+
+
+## My hardware
+- **Machine**: MacBook Pro, Apple M4 Pro
+- **Chip**: 14-core CPU (10P + 4E), 20-core GPU
+- **Memory**: 24 GB unified LPDDR5 (273 GB/s)
+- **SSD**: 512MB Apple ssd, **6,100 GB/s random reads (with purge), 
+- **macOS**: 15.7.4
 
 ## Architecture
 
