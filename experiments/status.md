@@ -5,12 +5,39 @@ Keep track of all experiment status in this file.
 3. Attempt to implement
 4. Add status of implementation to this doc
 5. If successful:
- 5.1 benchmark with --timing and add results to this document
+ 5.1 benchmark and add results to this document (see Benchmarking below)
  5.2 update implementation doc with what worked or didn't
  5.3 create a commit of changes in this directory and merge back into main
  5.4 create a commit of all changes, but leave in experiment specific branch
 
 
+
+# Benchmarking
+
+## Quick benchmark (10 queries × 100 tokens)
+```bash
+cd metal_infer
+./benchmark.sh ../models/Qwen3.5-35B-A3B-4bit --k 8
+./benchmark.sh ../models/Qwen3-Coder-Next-4bit --k 10
+./benchmark.sh ../models/Qwen3.5-35B-A3B-8bit --k 8
+```
+
+Reports per-query tok/s and TTFT, plus min/avg/median/max summary.
+
+## Per-layer timing breakdown
+```bash
+./infer --model ../models/Qwen3.5-35B-A3B-4bit --prompt "Hello" --tokens 100 --k 8 --timing
+```
+
+Shows avg ms per phase: expert_io (SSD), cmd1_wait/cmd2_wait (GPU), cpu_attn (CPU), etc.
+
+## Baseline results (M4 Pro, 24GB)
+
+| Model | tok/s (median) | TTFT (avg) | Expert size | K |
+|-------|---------------|-----------|-------------|---|
+| Qwen3.5-35B-A3B-4bit | 16.74 | 1247ms | 1.7MB | 8 |
+| Qwen3.5-35B-A3B-8bit | 8.29 | 2957ms | 3.3MB | 8 |
+| Qwen3-Coder-Next-4bit | 8.52 | 2613ms | 1.7MB | 10 |
 
 # Experiments:
 
