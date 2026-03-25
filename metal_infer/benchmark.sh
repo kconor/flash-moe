@@ -39,7 +39,8 @@ make -s -C "$(dirname "$0")" 2>/dev/null || true
 
 # Start server
 INFER="$(dirname "$0")/infer"
-"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing 2>"$STDERR_LOG" &
+PREDICTOR_FILE="$(dirname "$0")/../models/$(basename "$MODEL")/predictor_bench.bin"
+"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing --collect-predictor "$PREDICTOR_FILE" 2>"$STDERR_LOG" &
 SERVER_PID=$!
 
 # Wait for health check

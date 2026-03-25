@@ -6897,7 +6897,7 @@ int main(int argc, char **argv) {
                     }
                     break;
                 case 'X':
-                    g_predictor_log = fopen(optarg, "wb");
+                    g_predictor_log = fopen(optarg, "ab");
                     if (!g_predictor_log) {
                         fprintf(stderr, "ERROR: cannot open predictor log: %s\n", optarg);
                         return 1;
