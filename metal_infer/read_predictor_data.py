@@ -17,6 +17,7 @@ Binary format per record:
 """
 
 import argparse
+import os
 import struct
 import sys
 
@@ -28,6 +29,9 @@ def main():
     parser.add_argument("file", help="Path to predictor_data.bin")
     parser.add_argument("--hidden-dim", type=int, default=3072, help="Hidden dimension (default: 3072)")
     parser.add_argument("--summary", action="store_true", help="Print summary statistics only")
+    parser.add_argument("--to-npz", type=str, default=None, metavar="PATH",
+                        help="Export to .npz with X, Y (multi-hot), layers arrays")
+    parser.add_argument("--num-experts", type=int, default=256, help="Number of experts (default: 256)")
     args = parser.parse_args()
 
     data = open(args.file, "rb").read()
@@ -62,6 +66,32 @@ def main():
     print(f"Hidden dim: {hidden_dim}, K: {records[0][3] if records else '?'}")
     print(f"File size: {len(data) / 1e6:.1f} MB")
     print()
+
+    # Export to npz if requested
+    if args.to_npz and records:
+        n = len(records)
+        num_experts = args.num_experts
+        X = np.zeros((n, hidden_dim), dtype=np.float32)
+        Y = np.zeros((n, num_experts), dtype=np.float32)
+        layers = np.zeros(n, dtype=np.int32)
+        tokens = np.zeros(n, dtype=np.int32)
+
+        for i, (ti, li, h, K, experts) in enumerate(records):
+            X[i] = h
+            layers[i] = li
+            tokens[i] = ti
+            for e in experts:
+                if 0 <= e < num_experts:
+                    Y[i, e] = 1.0
+
+        np.savez(args.to_npz, X=X, Y=Y, layers=layers, tokens=tokens)
+        print(f"Exported to {args.to_npz}:")
+        print(f"  X: {X.shape} float32 (pre-attention hidden states)")
+        print(f"  Y: {Y.shape} float32 (multi-hot expert labels, {Y.sum(axis=1).mean():.0f} active per sample)")
+        print(f"  layers: {layers.shape} int32")
+        print(f"  tokens: {tokens.shape} int32")
+        print(f"  Size: {os.path.getsize(args.to_npz) / 1e6:.1f} MB")
+        return
 
     if not args.summary:
         # Print first few records
