@@ -129,6 +129,11 @@ static uint64_t g_pred_layers = 0;
 static FILE *g_routing_log = NULL;
 static int g_routing_log_samples = 0;
 
+// Predictor training data: logs pre-attention hidden state + routing results
+static FILE *g_predictor_log = NULL;
+static int g_predictor_token_idx = 0;
+static float *s_pre_attn_hidden = NULL;  // snapshot of hidden before attention modifies it
+
 // LZ4 compressed expert support
 // File format: [LZ4IndexEntry × 512] + [compressed blobs]
 typedef struct {
@@ -4226,6 +4231,12 @@ static void fused_layer_forward(
     LayerWeightCache *lc = &layer_cache[layer_idx];
     int is_full = (kv != NULL);
 
+    // Snapshot pre-attention hidden state for predictor training data
+    if (g_predictor_log) {
+        if (!s_pre_attn_hidden) s_pre_attn_hidden = malloc(HIDDEN_DIM * sizeof(float));
+        memcpy(s_pre_attn_hidden, hidden, HIDDEN_DIM * sizeof(float));
+    }
+
     // =====================================================================
     // PHASE 1: Deferred completion + CMD1 (attention projections)
     // =====================================================================
@@ -5318,7 +5329,7 @@ static void fused_layer_forward(
 
     if (g_timing_enabled) { t1 = now_ms(); g_timing.routing_cpu += t1 - t0; }
 
-    // Log routing data for predictor training
+    // Log routing data for predictor training (post-attention hidden)
     if (g_routing_log) {
         int32_t li = layer_idx;
         int32_t ki = (K > MAX_K) ? MAX_K : K;
@@ -5327,6 +5338,18 @@ static void fused_layer_forward(
         fwrite(hidden, sizeof(float), HIDDEN_DIM, g_routing_log);
         fwrite(expert_indices, sizeof(int32_t), ki, g_routing_log);
         g_routing_log_samples++;
+    }
+
+    // Log pre-attention hidden state + routing result for predictor training
+    if (g_predictor_log && s_pre_attn_hidden) {
+        int32_t ti = g_predictor_token_idx;
+        int32_t li = layer_idx;
+        int32_t ki = (K > MAX_K) ? MAX_K : K;
+        fwrite(&ti, sizeof(int32_t), 1, g_predictor_log);
+        fwrite(&li, sizeof(int32_t), 1, g_predictor_log);
+        fwrite(s_pre_attn_hidden, sizeof(float), HIDDEN_DIM, g_predictor_log);
+        fwrite(&ki, sizeof(int32_t), 1, g_predictor_log);
+        fwrite(expert_indices, sizeof(int32_t), ki, g_predictor_log);
     }
 
     // ---- Parallel pread + GPU experts ----
@@ -6840,6 +6863,7 @@ int main(int argc, char **argv) {
             {"serve",         required_argument, 0, 'R'},
             {"predict",       no_argument,       0, 'D'},
             {"collect-routing", required_argument, 0, 'Z'},
+            {"collect-predictor", required_argument, 0, 'X'},
             {"help",          no_argument,       0, 'h'},
             {0, 0, 0, 0}
         };
@@ -6869,6 +6893,13 @@ int main(int argc, char **argv) {
                     g_routing_log = fopen(optarg, "wb");
                     if (!g_routing_log) {
                         fprintf(stderr, "ERROR: cannot open routing log: %s\n", optarg);
+                        return 1;
+                    }
+                    break;
+                case 'X':
+                    g_predictor_log = fopen(optarg, "wb");
+                    if (!g_predictor_log) {
+                        fprintf(stderr, "ERROR: cannot open predictor log: %s\n", optarg);
                         return 1;
                     }
                     break;
@@ -7217,6 +7248,7 @@ int main(int argc, char **argv) {
                 // by the next token's embedding. Only wait for GPU (buffer safety).
                 discard_deferred_experts();
                 pos++;
+                if (g_predictor_log) g_predictor_token_idx++;
 
                 if (token_idx == 0) {
                     first_tok_ms = now_ms() - t_tok;
@@ -7253,6 +7285,7 @@ int main(int argc, char **argv) {
             // Full completion — need hidden state for final norm + lm_head
             complete_deferred_experts();
             pos++;
+            if (g_predictor_log) g_predictor_token_idx++;
         }
 
         if (embed_batch) { free(embed_batch); embed_batch = NULL; }
@@ -7340,6 +7373,7 @@ int main(int argc, char **argv) {
             // Complete last layer's deferred GPU experts before final norm
             complete_deferred_experts();
             pos++;
+            if (g_predictor_log) g_predictor_token_idx++;
 
             // Final norm
             if (final_norm_w) {
@@ -7415,6 +7449,12 @@ int main(int argc, char **argv) {
             fprintf(stderr, "[routing] Logged %d samples to routing data file\n",
                     g_routing_log_samples);
             g_routing_log = NULL;
+        }
+        if (g_predictor_log) {
+            fclose(g_predictor_log);
+            fprintf(stderr, "[predictor] Logged %d tokens × %d layers to predictor data file\n",
+                    g_predictor_token_idx, NUM_LAYERS);
+            g_predictor_log = NULL;
         }
 
         // ---- Cleanup ----
