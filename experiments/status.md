@@ -83,3 +83,33 @@ Expert I/O fully overlapped with GPU. sum_phases dropped 61% confirming heavy pi
 **Why it failed:** Pre-attention hidden states don't predict post-attention routing well enough. 46% hit rate is worse than simply reusing the previous token's experts (temporal carry, 53%). Additionally, working set analysis shows the expert cache (~16 GB on 24GB machine) can only hold ~50% of expert data (32.6 GB total across 36 MoE layers × 512 experts × 1.77 MB). At 200+ tokens, cache fills regardless of prediction. See [exp3-expert-predictor.md](exp3-expert-predictor.md) for full analysis.
 
 **Branch:** `experiment/expert-predictor`
+
+## Experiment 5: mlock Model Weights
+**Hypothesis:** Wiring model_weights.bin into physical memory via mlock() prevents the kernel from evicting weight pages under memory pressure, eliminating GPU stalls during CMD1/CMD2.
+
+**Status:** Implemented and benchmarked — NO EFFECT (without memory pressure)
+
+**Results (Qwen3-Coder-Next-4bit, K=10, 10 queries × 100 tokens):**
+| Config | median tok/s | TTFT (avg) |
+|--------|-------------|-----------|
+| Baseline | 10.29 | 2194 ms |
+| mlock weights | 10.41 | 2132 ms |
+
+No meaningful difference — mlock only helps when something else (e.g., a custom cache) is creating memory pressure. Without memory pressure, the OS keeps weight pages resident naturally. However, mlock proved critical when combined with CLOCK-Pro cache (4.76 → 8.08 tok/s, see experiment 4).
+
+**Branch:** `experiment/mlock-weights`
+
+## Experiment 6: MADV_RANDOM on Expert mmaps
+**Hypothesis:** Telling the kernel expert access is random (MADV_RANDOM) will disable readahead on mmap'd expert layer files, saving SSD bandwidth. Previous testing on M3 Max/397B (7 MB experts) found it hurt — re-testing on M4 Pro with 1.7 MB experts.
+
+**Status:** Implemented and benchmarked — NO EFFECT
+
+**Results (Qwen3-Coder-Next-4bit, K=10, 10 queries × 100 tokens):**
+| Config | median tok/s | TTFT (avg) |
+|--------|-------------|-----------|
+| Baseline | 10.29 | 2194 ms |
+| MADV_RANDOM | 10.27 | 2185 ms |
+
+No meaningful difference on M4 Pro either. The F_RDAHEAD=0 already set on the fds likely does the same thing. Original finding confirmed: kernel default madvise is fine for expert files.
+
+**Branch:** `experiment/madv-random-experts`
