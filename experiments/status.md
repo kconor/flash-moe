@@ -69,3 +69,17 @@ Expert I/O fully overlapped with GPU. sum_phases dropped 61% confirming heavy pi
 | tok/s | 8.73 | 7.24 | **-17.1%** |
 
 **Why it failed:** The single CMD3 can't be committed until all experts are encoded. The encoding loop spins waiting for slow preads, moving the I/O wait into cmd3_encode instead of eliminating it. Worse than baseline because the spin-poll adds CPU overhead and the GPU stays idle longer (no deferred overlap with next layer).
+
+## Experiment 3: Expert Routing Predictor (pre-attention prefetch)
+**Hypothesis:** A linear predictor trained on pre-attention hidden states can predict expert routing during CMD1 wait, enabling SSD prefetch before routing completes. If hit rate >70%, cold reads are avoided on the critical path.
+
+**Status:** Implemented and evaluated — REJECTED
+
+**Results (Qwen3-Coder-Next-4bit, K=10, predictor_coding dataset):**
+| Metric | Predictor | Temporal baseline | Frequency baseline |
+|--------|-----------|-------------------|-------------------|
+| Hit rate | ~46% | ~53% | ~45% |
+
+**Why it failed:** Pre-attention hidden states don't predict post-attention routing well enough. 46% hit rate is worse than simply reusing the previous token's experts (temporal carry, 53%). Additionally, working set analysis shows the expert cache (~16 GB on 24GB machine) can only hold ~50% of expert data (32.6 GB total across 36 MoE layers × 512 experts × 1.77 MB). At 200+ tokens, cache fills regardless of prediction. See [exp3-expert-predictor.md](exp3-expert-predictor.md) for full analysis.
+
+**Branch:** `experiment/expert-predictor`
