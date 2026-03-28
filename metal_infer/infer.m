@@ -603,6 +603,14 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     // Advise sequential access
     madvise(data, size, MADV_SEQUENTIAL);
 
+    // Wire weight pages into physical memory so they can't be evicted.
+    // These weights are read by the GPU every single token.
+    if (mlock(data, size) != 0) {
+        fprintf(stderr, "WARNING: mlock weights failed: %s (%.2f GB)\n", strerror(errno), size / 1e9);
+    } else {
+        printf("[weights] mlock'd %.2f GB (wired into physical memory)\n", size / 1e9);
+    }
+
     TensorManifest *manifest = load_manifest(json_path);
     if (!manifest) {
         munmap(data, size);
