@@ -7093,11 +7093,10 @@ int main(int argc, char **argv) {
                     layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
-                        // No madvise: kernel default is best.
-                        // MADV_RANDOM disables readahead (tested: hurts).
-                        // MADV_SEQUENTIAL doesn't reduce I/O fragmentation (tested: no effect).
-                        // The kernel fragments 3.9MB preads into ~5.7 disk ops regardless
-                        // of hints — this is inherent to the page cache's physical page layout.
+                        // MADV_RANDOM: tell kernel expert access is random, disable readahead.
+                        // Previously tested on M3 Max/397B and found to hurt — re-testing
+                        // on M4 Pro with smaller experts (1.7 MB vs 7 MB).
+                        madvise(layer_mmaps[i], st.st_size, MADV_RANDOM);
                     }
                 }
             }
