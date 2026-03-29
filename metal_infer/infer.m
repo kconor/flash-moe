@@ -594,7 +594,7 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     fstat(fd, &st);
     size_t size = st.st_size;
 
-    void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (data == MAP_FAILED) {
         fprintf(stderr, "ERROR: mmap failed: %s\n", strerror(errno));
@@ -7115,7 +7115,7 @@ int main(int argc, char **argv) {
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, layer_fds[i], 0);
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
                         // MADV_RANDOM: tell kernel expert access is random, disable readahead.
