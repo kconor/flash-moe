@@ -35,11 +35,12 @@ echo "Tokens: $TOKENS"
 echo ""
 
 # Build if needed
-make -s -C "$(dirname "$0")" 2>/dev/null || true
+REPO_DIR="$(dirname "$0")/.."
+make -s -C "$REPO_DIR/metal_infer" 2>/dev/null || true
 
 # Start server
-INFER="$(dirname "$0")/infer"
-PREDICTOR_FILE="$(dirname "$0")/../models/$(basename "$MODEL")/predictor_bench.bin"
+INFER="$REPO_DIR/metal_infer/infer"
+PREDICTOR_FILE="$REPO_DIR/models/$(basename "$MODEL")/predictor_bench.bin"
 "$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing --collect-predictor "$PREDICTOR_FILE" 2>"$STDERR_LOG" &
 SERVER_PID=$!
 
