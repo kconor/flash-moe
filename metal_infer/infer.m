@@ -597,7 +597,7 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     fstat(fd, &st);
     size_t size = st.st_size;
 
-    void *data = mmap(NULL, size, PROT_READ, MAP_PRIVATE, fd, 0);
+    void *data = mmap(NULL, size, PROT_READ, MAP_SHARED, fd, 0);
     close(fd);
     if (data == MAP_FAILED) {
         fprintf(stderr, "ERROR: mmap failed: %s\n", strerror(errno));
