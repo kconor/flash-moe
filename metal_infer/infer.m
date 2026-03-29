@@ -3158,6 +3158,12 @@ static void *io_pool_worker(void *arg) {
                 } else {
                     t->result = -1;
                 }
+            } else if (t->mmap_base) {
+                // mmap path: prefault expert range then memcpy
+                const void *src = (const char *)t->mmap_base + t->offset;
+                madvise((void *)src, t->size, MADV_WILLNEED);
+                memcpy(t->dst, src, t->size);
+                t->result = (ssize_t)t->size;
             } else {
                 t->result = pread(t->fd, t->dst, t->size, t->offset);
             }
@@ -3228,18 +3234,26 @@ static void async_pread_start(int packed_fd, int *expert_indices, int K,
         g_async_pread.tasks[k].offset = (off_t)expert_indices[k] * esz;
         g_async_pread.tasks[k].size = esz;
         g_async_pread.tasks[k].result = 0;
+        g_async_pread.tasks[k].mmap_base = mmap_base;
         g_async_pread.ready[k] = 0;
         g_async_pread.valid[k] = 0;
     }
 
-    // Fire off parallel preads on GCD — returns immediately
+    // Fire off parallel reads on GCD — returns immediately
     static dispatch_queue_t io_q = NULL;
     if (!io_q) io_q = dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0);
     for (int k = 0; k < K; k++) {
         InferPreadTask *t = &g_async_pread.tasks[k];
         int kk = k;
         dispatch_group_async(g_async_pread.group, io_q, ^{
-            t->result = pread(t->fd, t->dst, t->size, t->offset);
+            if (t->mmap_base) {
+                const void *src = (const char *)t->mmap_base + t->offset;
+                madvise((void *)src, t->size, MADV_WILLNEED);
+                memcpy(t->dst, src, t->size);
+                t->result = (ssize_t)t->size;
+            } else {
+                t->result = pread(t->fd, t->dst, t->size, t->offset);
+            }
             g_async_pread.valid[kk] = (t->result == (ssize_t)t->size);
             __sync_synchronize();
             g_async_pread.ready[kk] = 1;
