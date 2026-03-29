@@ -14,11 +14,13 @@ shift
 K=8
 TOKENS=100
 PORT=8099
+EXTRA_ARGS=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --k) K="$2"; shift 2 ;;
         --tokens) TOKENS="$2"; shift 2 ;;
         --port) PORT="$2"; shift 2 ;;
+        --mlock-cache) EXTRA_ARGS="$EXTRA_ARGS --mlock-cache $2"; shift 2 ;;
         *) echo "Unknown arg: $1"; exit 1 ;;
     esac
 done
@@ -32,6 +34,7 @@ echo "=== Flash-MoE Benchmark ==="
 echo "Model:  $MODEL_NAME"
 echo "K:      $K"
 echo "Tokens: $TOKENS"
+[ -n "$EXTRA_ARGS" ] && echo "Extra:  $EXTRA_ARGS"
 echo ""
 
 # Build if needed
@@ -41,7 +44,7 @@ make -s -C "$REPO_DIR/metal_infer" 2>/dev/null || true
 # Start server
 INFER="$REPO_DIR/metal_infer/infer"
 PREDICTOR_FILE="$REPO_DIR/models/$(basename "$MODEL")/predictor_bench.bin"
-"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing --collect-predictor "$PREDICTOR_FILE" 2>"$STDERR_LOG" &
+"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing --collect-predictor "$PREDICTOR_FILE" $EXTRA_ARGS 2>"$STDERR_LOG" &
 SERVER_PID=$!
 
 # Wait for health check

@@ -109,6 +109,7 @@ typedef struct {
     double routing_cpu;      // CPU softmax + topK
     double spec_route;       // speculative early routing (gate matvec + topK)
     double expert_io;        // parallel pread + cache lookup
+    double mlock_sweep;      // mlock/munlock syscalls (clock cache)
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
     double total;            // total per-layer time
     int count;               // number of layers timed
@@ -313,6 +314,8 @@ static void timing_print(void) {
     fprintf(stderr, "  cmd2_wait:      %6.3f\n", g_timing.cmd2_wait / n);
     fprintf(stderr, "  routing_cpu:    %6.3f\n", g_timing.routing_cpu / n);
     fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
+    if (g_timing.mlock_sweep > 0)
+        fprintf(stderr, "  mlock_sweep:    %6.3f\n", g_timing.mlock_sweep / n);
     fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
     fprintf(stderr, "  sum_phases:     %6.3f\n",
@@ -320,7 +323,7 @@ static void timing_print(void) {
              g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.spec_route +
              g_timing.cpu_attn +
              g_timing.cmd2_encode + g_timing.cmd2_wait + g_timing.routing_cpu +
-             g_timing.expert_io + g_timing.cmd3_encode) / n);
+             g_timing.expert_io + g_timing.mlock_sweep + g_timing.cmd3_encode) / n);
     fprintf(stderr, "  cmd_buffers:    %d (3 per layer: CMD1+CMD2+CMD3)\n", n * 3);
     fprintf(stderr, "  sync_waits:     %d (2 per layer: CMD1+CMD2, CMD3 deferred)\n", n * 2);
     fprintf(stderr, "  gpu_encoders:   ~%d per layer (CMD1:3-4, CMD2:8-12, CMD3:~10)\n",
@@ -3684,6 +3687,7 @@ static MlockClockCache *mlock_clock_init(void **mmaps, size_t *mmap_sizes, int m
     mc->max_locked = max_locked;
     mc->referenced = calloc((size_t)NUM_LAYERS * NUM_EXPERTS, sizeof(uint8_t));
     mc->locked = calloc((size_t)NUM_LAYERS * NUM_EXPERTS, sizeof(uint8_t));
+
     printf("[mlock-clock] Budget: %d experts (%.1f GB), expert size: %zu bytes\n",
            max_locked, (double)max_locked * mc->expert_size / 1e9, mc->expert_size);
     return mc;
@@ -3724,6 +3728,26 @@ static void mlock_clock_evict(MlockClockCache *mc) {
 // Lightweight access: just set reference bit. No syscalls.
 static inline void mlock_clock_access(MlockClockCache *mc, int layer, int expert) {
     mc->referenced[layer * NUM_EXPERTS + expert] = 1;
+}
+
+// Inline per-layer sweep: mlock new experts, evict cold ones.
+static void mlock_clock_sweep_layer(MlockClockCache *mc, int layer, int *experts, int K) {
+    for (int k = 0; k < K; k++) {
+        int idx = layer * NUM_EXPERTS + experts[k];
+        if (!mc->locked[idx]) {
+            if (mc->layer_mmaps[layer] && mc->layer_mmaps[layer] != MAP_FAILED) {
+                void *addr = (char *)mc->layer_mmaps[layer] + (size_t)experts[k] * mc->expert_size;
+                if (mlock(addr, mc->expert_size) == 0) {
+                    mc->locked[idx] = 1;
+                    mc->num_locked++;
+                    mc->lock_ops++;
+                }
+            }
+        }
+    }
+    if (mc->num_locked > mc->max_locked) {
+        mlock_clock_evict(mc);
+    }
 }
 
 // Periodic sweep: mlock new hot experts, munlock cold ones.
@@ -5731,30 +5755,10 @@ static void fused_layer_forward(
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
 
-        // mlock-clock: mark experts as referenced (cheap, just sets a bit).
-        // Actual mlock/munlock happens in the sweep on the last MoE layer.
+        // mlock-clock: mark experts as referenced (just sets a bit, no syscalls)
         if (g_mlock_cache) {
             for (int k = 0; k < actual_K; k++) {
                 mlock_clock_access(g_mlock_cache, layer_idx, expert_indices[k]);
-            }
-            // Sweep: mlock new experts and evict cold ones.
-            // Only on the last layer to amortize syscall cost across all layers.
-            if (layer_idx == NUM_LAYERS - 1) {
-                // Retroactively mlock all experts referenced this token across all layers
-                for (int l = 0; l < NUM_LAYERS; l++) {
-                    // Collect referenced experts for this layer
-                    int ref_experts[MAX_K];
-                    int ref_count = 0;
-                    for (int e = 0; e < NUM_EXPERTS && ref_count < (K > MAX_K ? MAX_K : K); e++) {
-                        int idx = l * NUM_EXPERTS + e;
-                        if (g_mlock_cache->referenced[idx] && !g_mlock_cache->locked[idx]) {
-                            ref_experts[ref_count++] = e;
-                        }
-                    }
-                    if (ref_count > 0) {
-                        mlock_clock_sweep(g_mlock_cache, l, ref_experts, ref_count);
-                    }
-                }
             }
         }
 
@@ -7252,7 +7256,9 @@ int main(int argc, char **argv) {
                 fcntl(layer_fds[i], F_RDAHEAD, 0);
                 struct stat st;
                 if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
-                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, layer_fds[i], 0);
+                    // MAP_SHARED: pages map directly to UBC with no COW overhead.
+                    // Critical for mlock performance — avoids shadow page materialization.
+                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, layer_fds[i], 0);
                     if (layer_mmaps[i] != MAP_FAILED) {
                         layer_mmap_sizes[i] = st.st_size;
                         // MADV_RANDOM: tell kernel expert access is random, disable readahead.
@@ -7567,6 +7573,33 @@ int main(int argc, char **argv) {
             // Print decoded token
             printf("%s", decode_token(vocab, next_token));
             fflush(stdout);
+
+            // mlock-clock: sweep once per token — mlock new experts, munlock cold ones.
+            // All layers' reference bits were set during this token's forward pass.
+            if (g_mlock_cache) {
+                double t_sweep = 0;
+                if (g_timing_enabled) t_sweep = now_ms();
+                for (int l = 0; l < NUM_LAYERS; l++) {
+                    // Find newly-referenced, unlocked experts for this layer
+                    for (int e = 0; e < NUM_EXPERTS; e++) {
+                        int idx = l * NUM_EXPERTS + e;
+                        if (g_mlock_cache->referenced[idx] && !g_mlock_cache->locked[idx]) {
+                            if (g_mlock_cache->layer_mmaps[l] && g_mlock_cache->layer_mmaps[l] != MAP_FAILED) {
+                                void *addr = (char *)g_mlock_cache->layer_mmaps[l] + (size_t)e * g_mlock_cache->expert_size;
+                                if (mlock(addr, g_mlock_cache->expert_size) == 0) {
+                                    g_mlock_cache->locked[idx] = 1;
+                                    g_mlock_cache->num_locked++;
+                                    g_mlock_cache->lock_ops++;
+                                }
+                            }
+                        }
+                    }
+                }
+                if (g_mlock_cache->num_locked > g_mlock_cache->max_locked)
+                    mlock_clock_evict(g_mlock_cache);
+                if (g_timing_enabled)
+                    g_timing.mlock_sweep += now_ms() - t_sweep;
+            }
 
             double t_gen_end = now_ms();
             double tok_time = t_gen_end - t_gen_start;
