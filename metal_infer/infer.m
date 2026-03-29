@@ -3654,6 +3654,125 @@ static void malloc_cache_free(MallocExpertCache *cache) {
 }
 
 // ============================================================================
+// CLOCK-mlock expert cache.
+// Uses mlock/munlock on the existing mmap'd expert layer files to guarantee
+// hot experts stay resident in the UBC. No anonymous buffers, no F_NOCACHE,
+// no extra memory. The CLOCK algorithm decides which experts to protect.
+// Baseline pread path unchanged — mlocked experts just hit UBC faster.
+// ============================================================================
+
+typedef struct {
+    void **layer_mmaps;          // [NUM_LAYERS] mmap base pointers (borrowed, not owned)
+    size_t *layer_sizes;         // [NUM_LAYERS] mmap sizes (borrowed)
+    uint8_t *referenced;         // [NUM_LAYERS * NUM_EXPERTS] reference bit
+    uint8_t *locked;             // [NUM_LAYERS * NUM_EXPERTS] currently mlocked?
+    int clock_hand;              // sweep position (flat index into layers*experts)
+    int max_locked;              // budget: max experts to keep mlocked
+    int num_locked;              // current mlock count
+    size_t expert_size;
+    uint64_t lock_ops, unlock_ops;
+} MlockClockCache;
+
+static MlockClockCache *g_mlock_cache = NULL;
+
+static MlockClockCache *mlock_clock_init(void **mmaps, size_t *mmap_sizes, int max_locked) {
+    MlockClockCache *mc = calloc(1, sizeof(MlockClockCache));
+    mc->layer_mmaps = mmaps;
+    mc->layer_sizes = mmap_sizes;
+    mc->expert_size = active_expert_size();
+    mc->max_locked = max_locked;
+    mc->referenced = calloc((size_t)NUM_LAYERS * NUM_EXPERTS, sizeof(uint8_t));
+    mc->locked = calloc((size_t)NUM_LAYERS * NUM_EXPERTS, sizeof(uint8_t));
+    printf("[mlock-clock] Budget: %d experts (%.1f GB), expert size: %zu bytes\n",
+           max_locked, (double)max_locked * mc->expert_size / 1e9, mc->expert_size);
+    return mc;
+}
+
+// Evict: sweep clock hand, munlock unreferenced experts
+static void mlock_clock_evict(MlockClockCache *mc) {
+    int total = NUM_LAYERS * NUM_EXPERTS;
+    int swept = 0;
+    int max_evict = NUM_EXPERTS;  // cap per call
+    int evicted = 0;
+    while (mc->num_locked > mc->max_locked && swept < total * 2 && evicted < max_evict) {
+        int idx = mc->clock_hand;
+        if (mc->locked[idx]) {
+            if (mc->referenced[idx]) {
+                // Second chance: clear ref, skip
+                mc->referenced[idx] = 0;
+            } else {
+                // Evict: munlock this expert
+                int layer = idx / NUM_EXPERTS;
+                int expert = idx % NUM_EXPERTS;
+                if (mc->layer_mmaps[layer] && mc->layer_mmaps[layer] != MAP_FAILED) {
+                    void *addr = (char *)mc->layer_mmaps[layer] + (size_t)expert * mc->expert_size;
+                    munlock(addr, mc->expert_size);
+                    mc->locked[idx] = 0;
+                    mc->num_locked--;
+                    mc->unlock_ops++;
+                    evicted++;
+                }
+            }
+        }
+        mc->clock_hand = (idx + 1) % total;
+        swept++;
+    }
+}
+
+// Access: mlock the expert, set reference bit, evict if over budget
+// Lightweight access: just set reference bit. No syscalls.
+static inline void mlock_clock_access(MlockClockCache *mc, int layer, int expert) {
+    mc->referenced[layer * NUM_EXPERTS + expert] = 1;
+}
+
+// Periodic sweep: mlock new hot experts, munlock cold ones.
+// Call once per token (not per layer) to amortize syscall cost.
+static void mlock_clock_sweep(MlockClockCache *mc, int layer_idx,
+                               int *expert_indices, int K) {
+    // mlock the K experts from this layer if not already locked
+    for (int k = 0; k < K; k++) {
+        int idx = layer_idx * NUM_EXPERTS + expert_indices[k];
+        if (!mc->locked[idx]) {
+            if (mc->layer_mmaps[layer_idx] && mc->layer_mmaps[layer_idx] != MAP_FAILED) {
+                void *addr = (char *)mc->layer_mmaps[layer_idx] + (size_t)expert_indices[k] * mc->expert_size;
+                if (mlock(addr, mc->expert_size) == 0) {
+                    mc->locked[idx] = 1;
+                    mc->num_locked++;
+                    mc->lock_ops++;
+                }
+            }
+        }
+    }
+
+    // Evict if over budget — only run eviction once per sweep call
+    if (mc->num_locked > mc->max_locked) {
+        mlock_clock_evict(mc);
+    }
+}
+
+static void mlock_clock_free(MlockClockCache *mc) {
+    if (!mc) return;
+    // munlock everything
+    int unlocked = 0;
+    for (int i = 0; i < NUM_LAYERS * NUM_EXPERTS; i++) {
+        if (mc->locked[i]) {
+            int layer = i / NUM_EXPERTS;
+            int expert = i % NUM_EXPERTS;
+            if (mc->layer_mmaps[layer] && mc->layer_mmaps[layer] != MAP_FAILED) {
+                void *addr = (char *)mc->layer_mmaps[layer] + (size_t)expert * mc->expert_size;
+                munlock(addr, mc->expert_size);
+                unlocked++;
+            }
+        }
+    }
+    printf("[mlock-clock] Stats: %llu mlock ops, %llu munlock ops, %d locked at exit (unlocked all)\n",
+           mc->lock_ops, mc->unlock_ops, unlocked);
+    free(mc->referenced);
+    free(mc->locked);
+    free(mc);
+}
+
+// ============================================================================
 // Background prefetch thread for double-buffered expert I/O (from main.m).
 // Runs pread on a background thread while main thread does GPU compute.
 // Uses pure C I/O plan to avoid ARC issues across threads.
@@ -5611,6 +5730,33 @@ static void fused_layer_forward(
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.expert_io += t1 - t0; }
 
+        // mlock-clock: mark experts as referenced (cheap, just sets a bit).
+        // Actual mlock/munlock happens in the sweep on the last MoE layer.
+        if (g_mlock_cache) {
+            for (int k = 0; k < actual_K; k++) {
+                mlock_clock_access(g_mlock_cache, layer_idx, expert_indices[k]);
+            }
+            // Sweep: mlock new experts and evict cold ones.
+            // Only on the last layer to amortize syscall cost across all layers.
+            if (layer_idx == NUM_LAYERS - 1) {
+                // Retroactively mlock all experts referenced this token across all layers
+                for (int l = 0; l < NUM_LAYERS; l++) {
+                    // Collect referenced experts for this layer
+                    int ref_experts[MAX_K];
+                    int ref_count = 0;
+                    for (int e = 0; e < NUM_EXPERTS && ref_count < (K > MAX_K ? MAX_K : K); e++) {
+                        int idx = l * NUM_EXPERTS + e;
+                        if (g_mlock_cache->referenced[idx] && !g_mlock_cache->locked[idx]) {
+                            ref_experts[ref_count++] = e;
+                        }
+                    }
+                    if (ref_count > 0) {
+                        mlock_clock_sweep(g_mlock_cache, l, ref_experts, ref_count);
+                    }
+                }
+            }
+        }
+
         // Store this layer's routing for next token's temporal prediction.
         if (g_pred_enabled && g_pred_generating) {
             for (int k = 0; k < actual_K; k++) {
@@ -6822,6 +6968,7 @@ static void print_usage(const char *prog) {
     printf("  --k N                Active experts per layer (default: 4)\n");
     printf("  --cache-entries N    Expert LRU cache size (default: 2500, 0 = disabled)\n");
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
+    printf("  --mlock-cache N      CLOCK-mlock cache, N = size in GB (pins hot experts in UBC)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
@@ -6847,6 +6994,7 @@ int main(int argc, char **argv) {
         int K = 4;
         int cache_entries = 0;  // default 0: trust OS page cache (38% faster than Metal LRU)
         int malloc_cache_entries = 0;  // 0 = disabled (override with --malloc-cache)
+        int mlock_cache_gb = 0;      // 0 = disabled (override with --mlock-cache)
         int serve_port = 0;  // 0 = disabled, >0 = HTTP serve mode
 
         static struct option long_options[] = {
@@ -6860,6 +7008,7 @@ int main(int argc, char **argv) {
             {"k",             required_argument, 0, 'k'},
             {"cache-entries",  required_argument, 0, 'C'},
             {"malloc-cache",   required_argument, 0, 'M'},
+            {"mlock-cache",    required_argument, 0, 'W'},
             {"cpu-linear",    no_argument,       0, 'L'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
@@ -6877,7 +7026,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:W:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6889,6 +7038,7 @@ int main(int argc, char **argv) {
                 case 'k': K = atoi(optarg); break;
                 case 'C': cache_entries = atoi(optarg); break;
                 case 'M': malloc_cache_entries = atoi(optarg); break;
+                case 'W': mlock_cache_gb = atoi(optarg); break;
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
@@ -7110,6 +7260,13 @@ int main(int argc, char **argv) {
             }
         }
         printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
+
+        // ---- Initialize mlock-clock cache (if requested) ----
+        if (mlock_cache_gb > 0) {
+            size_t esz = active_expert_size();
+            int max_locked = (int)((uint64_t)mlock_cache_gb * 1000000000ULL / esz);
+            g_mlock_cache = mlock_clock_init(layer_mmaps, layer_mmap_sizes, max_locked);
+        }
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
@@ -7473,6 +7630,10 @@ int main(int argc, char **argv) {
         if (g_expert_cache) {
             expert_cache_free(g_expert_cache);
             g_expert_cache = NULL;
+        }
+        if (g_mlock_cache) {
+            mlock_clock_free(g_mlock_cache);
+            g_mlock_cache = NULL;
         }
         for (int i = 0; i < NUM_LAYERS; i++) {
             if (kv_caches[i]) kv_cache_free(kv_caches[i]);
