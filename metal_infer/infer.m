@@ -1154,7 +1154,10 @@ static MetalCtx *metal_setup(void) {
 
     // Compile shaders from source
     NSError *error = nil;
-    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal"];
+    // Find shaders.metal: check CWD, repo root, and next to the binary itself
+    NSString *binDir = [[[NSProcessInfo processInfo].arguments[0] stringByResolvingSymlinksInPath] stringByDeletingLastPathComponent];
+    NSArray *paths = @[@"shaders.metal", @"metal_infer/shaders.metal",
+                       [binDir stringByAppendingPathComponent:@"shaders.metal"]];
     NSString *src = nil;
     for (NSString *p in paths) {
         src = [NSString stringWithContentsOfFile:p encoding:NSUTF8StringEncoding error:&error];
@@ -6747,6 +6750,7 @@ static void serve_loop(
             double prefill_ms = now_ms() - t_prefill;
             fprintf(stderr, "[serve] %s prefill=%d tokens in %.0fms\n",
                     request_id, pt->count, prefill_ms);
+            fflush(stderr);
 
             // ---- Final norm + LM head for first token ----
             if (final_norm_w) {
@@ -6855,6 +6859,7 @@ static void serve_loop(
             fprintf(stderr, "[serve] %s generated=%d tokens in %.0fms (%.2f tok/s)\n",
                     request_id, gen_count, gen_ms,
                     gen_count > 0 ? gen_count * 1000.0 / gen_ms : 0.0);
+            fflush(stderr);
             if (g_expert_cache) {
                 cache_telemetry_print(g_expert_cache->hits, g_expert_cache->misses);
             } else if (g_malloc_cache) {
@@ -7040,7 +7045,8 @@ int main(int argc, char **argv) {
         // ---- Initialize Metal ----
         g_metal = metal_setup();
         if (!g_metal) {
-            fprintf(stderr, "WARNING: Metal init failed, falling back to CPU\n");
+            fprintf(stderr, "FATAL: Metal init failed. GPU is required.\n");
+            exit(1);
         }
 
         // ---- Initialize persistent I/O thread pool ----
