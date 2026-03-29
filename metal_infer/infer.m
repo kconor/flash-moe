@@ -116,6 +116,7 @@ typedef struct {
 
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
+static int g_token_timing = 0;  // per-token timing stream (--token-timing)
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -6824,6 +6825,7 @@ static void print_usage(const char *prog) {
     printf("  --malloc-cache N     Malloc expert cache entries (e.g., 2581 = 17GB for 80%% hit)\n");
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
+    printf("  --token-timing       Print per-token timing stream to stderr\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
@@ -6863,6 +6865,7 @@ int main(int argc, char **argv) {
             {"cpu-linear",    no_argument,       0, 'L'},
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
+            {"token-timing",  no_argument,       0, 'I'},
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
@@ -6877,7 +6880,7 @@ int main(int argc, char **argv) {
         };
 
         int c;
-        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTFE2Gh", long_options, NULL)) != -1) {
+        while ((c = getopt_long(argc, argv, "m:w:j:v:p:P:t:k:C:M:R:B:LSTIFE2Gh", long_options, NULL)) != -1) {
             switch (c) {
                 case 'm': model_path = optarg; break;
                 case 'w': weights_path = optarg; break;
@@ -6892,6 +6895,7 @@ int main(int argc, char **argv) {
                 case 'L': gpu_linear_attn_enabled = 0; break;
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
+                case 'I': g_token_timing = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
@@ -7411,8 +7415,9 @@ int main(int argc, char **argv) {
             double tok_time = t_gen_end - t_gen_start;
 
             // Print progress to stderr
-            fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
-                    gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
+            if (g_token_timing)
+                fprintf(stderr, "  [gen %d/%d] token_id=%d (%.0f ms, %.2f tok/s)\n",
+                        gen, max_tokens, next_token, tok_time, 1000.0 / tok_time);
         }
 
         if (g_timing_enabled) timing_print();
