@@ -113,3 +113,25 @@ No meaningful difference — mlock only helps when something else (e.g., a custo
 No meaningful difference on M4 Pro either. The F_RDAHEAD=0 already set on the fds likely does the same thing. Original finding confirmed: kernel default madvise is fine for expert files.
 
 **Branch:** `experiment/madv-random-experts`
+
+## Experiment 7: Zero-Copy GPU Expert Access (mmap → Metal buffer → GPU)
+**Hypothesis:** Eliminating the pread+memcpy step by wrapping mmap'd expert pages directly as Metal buffers saves ~6.5µs per expert (1.77MB memcpy). GPU reads directly from UBC pages via `newBufferWithBytesNoCopy`. Expected improvement: ~4% from eliminating memcpy overhead.
+
+**Status:** Implemented and benchmarked — REJECTED (-50% tok/s)
+
+**Implementation:** Per-expert individual mmaps (48 layers × 512 experts = 24,576 mmaps), each wrapped as a Metal buffer at init. I/O threads pre-fault pages via mlock before GPU dispatch. Tested three page-in strategies: madvise(WILLNEED)+touch loop, mlock, and main-thread touch. All produced the same result.
+
+**Results (Qwen3-Coder-Next-4bit, K=10):**
+| Config | tok/s | Notes |
+|--------|-------|-------|
+| Baseline (pread) | ~12 | 2MB-aligned anonymous Metal buffers |
+| Zero-copy mmap | ~6 | GPU reads from scattered file-backed pages |
+
+**Why it failed:** The baseline's memcpy isn't wasted work — it **compacts scattered UBC pages into contiguous, 2MB-aligned anonymous buffers**. The GPU dequant kernel is bandwidth-bound (~418 GiB/s). Reading from scattered 16KB file-backed pages causes:
+1. **TLB pressure**: 108 scattered pages vs 1 contiguous 2MB region (possibly 1 TLB entry with huge pages)
+2. **Memory controller coalescing**: Contiguous physical pages allow burst reads; scattered pages serialize
+3. The comment in the baseline says "pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB" — the GPU has the same alignment sensitivity
+
+**Key insight:** On unified memory architectures, the memcpy from UBC → aligned anonymous buffer is a necessary step for GPU bandwidth. Zero-copy only works when the source pages are already contiguous and well-aligned, which file-backed UBC pages are not.
+
+**Branch:** `experiment/mmap-zero-copy`
