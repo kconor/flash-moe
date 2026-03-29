@@ -155,4 +155,4 @@ This is a primary development machine. The engine explicitly controls memory:
 - No custom caches. Trust the OS.
 
 ## Running Experiments
-read experiements/status.md for additional instructions
+read experiements/results/status.md for additional instructions
