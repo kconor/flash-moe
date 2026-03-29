@@ -664,6 +664,45 @@ typedef struct {
     int num_tokens;
 } Vocabulary;
 
+// GPT/Qwen BPE byte-to-unicode decoding.
+// BPE tokenizers map bytes 0-255 to printable Unicode codepoints.
+// This reverses that mapping so we output actual UTF-8 text.
+static int bpe_unicode_to_byte(uint32_t cp) {
+    if (cp >= 33 && cp <= 126) return (int)cp;
+    if (cp >= 161 && cp <= 172) return (int)cp;
+    if (cp >= 174 && cp <= 255) return (int)cp;
+    if (cp >= 0x100 && cp <= 0x143) {
+        int idx = (int)(cp - 0x100);
+        if (idx <= 32) return idx;
+        if (idx <= 66) return 127 + (idx - 33);
+        if (idx == 67) return 173;
+    }
+    return -1;
+}
+
+static int bpe_decode_token(char *s, int len) {
+    int out = 0, i = 0;
+    while (i < len) {
+        uint32_t cp;
+        int cplen;
+        unsigned char c = (unsigned char)s[i];
+        if (c < 0x80) { cp = c; cplen = 1; }
+        else if ((c & 0xE0) == 0xC0 && i+1 < len) {
+            cp = ((c & 0x1F) << 6) | (s[i+1] & 0x3F); cplen = 2;
+        } else if ((c & 0xF0) == 0xE0 && i+2 < len) {
+            cp = ((c & 0x0F) << 12) | ((s[i+1] & 0x3F) << 6) | (s[i+2] & 0x3F); cplen = 3;
+        } else if ((c & 0xF8) == 0xF0 && i+3 < len) {
+            cp = ((c & 0x07) << 18) | ((s[i+1] & 0x3F) << 12) | ((s[i+2] & 0x3F) << 6) | (s[i+3] & 0x3F); cplen = 4;
+        } else { s[out++] = s[i++]; continue; }
+        int byte = bpe_unicode_to_byte(cp);
+        if (byte >= 0) { s[out++] = (char)byte; }
+        else { for (int j = 0; j < cplen; j++) s[out++] = s[i+j]; }
+        i += cplen;
+    }
+    s[out] = '\0';
+    return out;
+}
+
 static Vocabulary *load_vocab(const char *path) {
     FILE *f = fopen(path, "rb");
     if (!f) {
@@ -688,6 +727,13 @@ static Vocabulary *load_vocab(const char *path) {
             fread(v->tokens[i], 1, byte_len, f);
             v->tokens[i][byte_len] = '\0';
             v->lengths[i] = byte_len;
+        }
+    }
+
+    // Decode BPE byte encoding to raw UTF-8 in-place
+    for (uint32_t i = 0; i < num_entries; i++) {
+        if (v->tokens[i] && v->lengths[i] > 0) {
+            v->lengths[i] = bpe_decode_token(v->tokens[i], v->lengths[i]);
         }
     }
 
