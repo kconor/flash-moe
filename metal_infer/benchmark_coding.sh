@@ -6,6 +6,9 @@
 # and code generation throughput.
 #
 # Usage: ./benchmark_coding.sh <model_path> [--k N] [--tokens N]
+#
+
+sudo purge
 
 set -euo pipefail
 

@@ -5,7 +5,7 @@
 #
 # Starts the inference server, sends 10 prompts, collects timing stats.
 
-set -euo pipefail
+set -uo pipefail
 
 MODEL="${1:?Usage: ./benchmark.sh <model_path> [--k N] [--tokens N]}"
 shift
@@ -44,7 +44,7 @@ make -s -C "$REPO_DIR/metal_infer" 2>/dev/null || true
 # Start server
 INFER="$REPO_DIR/metal_infer/infer"
 PREDICTOR_FILE="$REPO_DIR/models/$(basename "$MODEL")/predictor_bench.bin"
-"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing --collect-predictor "$PREDICTOR_FILE" $EXTRA_ARGS 2>"$STDERR_LOG" &
+"$INFER" --model "$MODEL" --serve "$PORT" --k "$K" --timing $EXTRA_ARGS 2>"$STDERR_LOG" &
 SERVER_PID=$!
 
 # Wait for health check

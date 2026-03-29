@@ -6920,6 +6920,27 @@ static void serve_loop(
                 complete_deferred_experts();
                 pos++;
 
+                // mlock-clock sweep: mlock new experts, munlock cold ones
+                if (g_mlock_cache) {
+                    for (int l = 0; l < NUM_LAYERS; l++) {
+                        for (int e = 0; e < NUM_EXPERTS; e++) {
+                            int idx = l * NUM_EXPERTS + e;
+                            if (g_mlock_cache->referenced[idx] && !g_mlock_cache->locked[idx]) {
+                                if (g_mlock_cache->layer_mmaps[l] && g_mlock_cache->layer_mmaps[l] != MAP_FAILED) {
+                                    void *addr = (char *)g_mlock_cache->layer_mmaps[l] + (size_t)e * g_mlock_cache->expert_size;
+                                    if (mlock(addr, g_mlock_cache->expert_size) == 0) {
+                                        g_mlock_cache->locked[idx] = 1;
+                                        g_mlock_cache->num_locked++;
+                                        g_mlock_cache->lock_ops++;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if (g_mlock_cache->num_locked > g_mlock_cache->max_locked)
+                        mlock_clock_evict(g_mlock_cache);
+                }
+
                 if (final_norm_w) {
                     float *normed = malloc(HIDDEN_DIM * sizeof(float));
                     cpu_rms_norm(hidden, final_norm_w, normed, HIDDEN_DIM, RMS_NORM_EPS);
