@@ -117,6 +117,7 @@ typedef struct {
 static LayerTimingAccum g_timing = {0};
 static int g_timing_enabled = 0;
 static int g_token_timing = 0;  // per-token timing stream (--token-timing)
+static int g_trace_timing = 0;  // per-token layer-avg TSV trace to stderr
 
 // Temporal prediction pipeline counters (declared early for timing_print access)
 static int g_pred_enabled = 0;
@@ -7048,6 +7049,7 @@ static void print_usage(const char *prog) {
     printf("  --cpu-linear         Disable fused GPU delta-net and use the older CPU/hybrid linear path\n");
     printf("  --timing             Enable per-layer timing breakdown\n");
     printf("  --token-timing       Print per-token timing stream to stderr\n");
+    printf("  --trace-timing       Per-token layer-avg TSV trace to stderr\n");
     printf("  --freq               Enable expert frequency tracking + analysis\n");
     printf("  --cache-telemetry    Report cold vs eviction misses and reuse distance\n");
     printf("  --2bit               Use 2-bit quantized experts (packed_experts_2bit/)\n");
@@ -7088,6 +7090,7 @@ int main(int argc, char **argv) {
             {"skip-linear",   no_argument,       0, 'S'},
             {"timing",        no_argument,       0, 'T'},
             {"token-timing",  no_argument,       0, 'I'},
+            {"trace-timing",  no_argument,       0, 'J'},
             {"freq",          no_argument,       0, 'F'},
             {"cache-telemetry", no_argument,     0, 'E'},
             {"2bit",          no_argument,       0, '2'},
@@ -7118,6 +7121,7 @@ int main(int argc, char **argv) {
                 case 'S': linear_attn_bypass = 1; break;
                 case 'T': g_timing_enabled = 1; break;
                 case 'I': g_token_timing = 1; break;
+                case 'J': g_trace_timing = 1; g_timing_enabled = 1; break;
                 case 'F': g_freq_tracking = 1; break;
                 case 'E': g_cache_telemetry_enabled = 1; break;
                 case '2': g_use_2bit = 1; break;
@@ -7586,6 +7590,8 @@ int main(int argc, char **argv) {
 
         // ---- Auto-regressive generation ----
         if (g_timing_enabled) timing_reset();
+        if (g_trace_timing)
+            fprintf(stderr, "T\ttoken\tdef_wait\tdef_cpu\tinorm\tcmd1_sub\tcmd1_wait\tcpu_attn\tcmd2_enc\tcmd2_wait\troute\texpert_io\tcmd3_enc\ttotal\n");
         if (g_pred_enabled) {
             g_pred_generating = 1;  // enable prediction storage/use during generation
             g_pred_valid = 0;       // reset — first gen token builds predictions
@@ -7621,6 +7627,18 @@ int main(int argc, char **argv) {
             // Complete last layer's deferred GPU experts before final norm
             complete_deferred_experts();
             pos++;
+            if (g_trace_timing && g_timing.count > 0) {
+                int n = g_timing.count;
+                fprintf(stderr, "T\t%d\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\t%.3f\n",
+                    gen,
+                    g_timing.deferred_wait / n, g_timing.deferred_cpu / n,
+                    g_timing.input_norm / n,    g_timing.cmd1_submit / n,
+                    g_timing.cmd1_wait / n,     g_timing.cpu_attn / n,
+                    g_timing.cmd2_encode / n,   g_timing.cmd2_wait / n,
+                    g_timing.routing_cpu / n,   g_timing.expert_io / n,
+                    g_timing.cmd3_encode / n,   g_timing.total / n);
+                timing_reset();
+            }
             if (g_predictor_log) g_predictor_token_idx++;
 
             // Final norm
