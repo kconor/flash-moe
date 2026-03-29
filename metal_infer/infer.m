@@ -630,10 +630,19 @@ static WeightFile *open_weights(const char *bin_path, const char *json_path) {
     return wf;
 }
 
+// Silent lookup — returns NULL if not found (no warning).
+// Use when probing for optional/variant tensor names.
 static void *get_tensor_ptr(WeightFile *wf, const char *name) {
     TensorInfo *t = find_tensor(wf->manifest, name);
+    if (!t) return NULL;
+    return (char *)wf->data + t->offset;
+}
+
+// Lookup with warning — use when the tensor is required.
+static void *get_tensor_ptr_required(WeightFile *wf, const char *name) {
+    TensorInfo *t = find_tensor(wf->manifest, name);
     if (!t) {
-        fprintf(stderr, "WARNING: tensor '%s' not found\n", name);
+        fprintf(stderr, "ERROR: required tensor '%s' not found\n", name);
         return NULL;
     }
     return (char *)wf->data + t->offset;
@@ -4048,6 +4057,8 @@ static void build_layer_cache(WeightFile *wf) {
                 lc->z_s = get_tensor_ptr(wf, name);
                 snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_z.biases", i);
                 lc->z_b = get_tensor_ptr(wf, name);
+                if (!lc->qkv_w)
+                    fprintf(stderr, "ERROR: layer %d: no linear_attn qkv weights (tried fused and split)\n", i);
             }
             // Try fused ba (qwen3_next) first, then separate b + a
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_ba.weight", i);
@@ -4073,6 +4084,8 @@ static void build_layer_cache(WeightFile *wf) {
                 lc->a_s = get_tensor_ptr(wf, name);
                 snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", i);
                 lc->a_b = get_tensor_ptr(wf, name);
+                if (!lc->b_w)
+                    fprintf(stderr, "ERROR: layer %d: no linear_attn ba weights (tried fused and split)\n", i);
             }
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.conv1d.weight", i);
             lc->conv1d_w = get_tensor_ptr(wf, name);
