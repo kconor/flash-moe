@@ -162,11 +162,6 @@ static int g_think_budget = 2048; // max thinking tokens before force-emitting <
 static int *g_layer_fds_cold = NULL;    // [num_layers] cold fds (set in main)
 static uint8_t *g_expert_seen = NULL;   // [num_layers * (num_experts/8)] bitset: seen before?
 
-// Zero-copy per-expert mmaps: each expert gets its own mmap region + Metal buffer.
-// GPU reads directly from mmap'd pages (no pread, no memcpy).
-static void **g_expert_mmaps = NULL;          // [num_layers * num_experts] mmap pointers
-static id<MTLBuffer> __strong *g_expert_metal_bufs = NULL;  // [num_layers * num_experts] Metal buffers
-
 // Async pread state defined after InferPreadTask (see below)
 
 static inline int expert_is_seen(int layer, int expert) {
@@ -1139,8 +1134,6 @@ typedef struct {
     id<MTLBuffer> buf_delta_output;   // [8192] float
     id<MTLBuffer> buf_conv_input;     // [12288] float
     id<MTLBuffer> buf_conv_output;    // [12288] float
-    // Zero-copy mmap'd expert layer buffers (one per layer, wraps entire layer file)
-    id<MTLBuffer> buf_layer_experts[MAX_MODEL_LAYERS];
 } MetalCtx;
 
 static MetalCtx *g_metal = NULL;
@@ -1879,96 +1872,6 @@ static void gpu_encode_expert_forward_slot_buf(
         [enc setBytes:&gs       length:4 atIndex:7];
         uint32_t num_tgs = (down_out + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
-    }
-}
-
-// Encode one expert forward from a layer-wide Metal buffer (zero-copy mmap).
-// expert_base_off = expert_idx * expert_size within the layer buffer.
-static void gpu_encode_expert_forward_zerocopy(
-    MetalCtx *ctx,
-    id<MTLCommandBuffer> cmdbuf,
-    int k,                         // slot index (for gate/up/act/out scratch)
-    id<MTLBuffer> layer_buf,       // Metal buffer wrapping entire layer mmap
-    NSUInteger expert_base_off     // byte offset of this expert within layer_buf
-) {
-    NSUInteger gate_w_off, gate_s_off, gate_b_off;
-    NSUInteger up_w_off, up_s_off, up_b_off;
-    NSUInteger down_w_off, down_s_off, down_b_off;
-    if (g_use_2bit) {
-        gate_w_off = GATE_W_OFF_2; gate_s_off = GATE_S_OFF_2; gate_b_off = GATE_B_OFF_2;
-        up_w_off   = UP_W_OFF_2;   up_s_off   = UP_S_OFF_2;   up_b_off   = UP_B_OFF_2;
-        down_w_off = DOWN_W_OFF_2; down_s_off = DOWN_S_OFF_2; down_b_off = DOWN_B_OFF_2;
-    } else {
-        gate_w_off = GATE_W_OFF;  gate_s_off = GATE_S_OFF;  gate_b_off = GATE_B_OFF;
-        up_w_off   = UP_W_OFF;    up_s_off   = UP_S_OFF;    up_b_off   = UP_B_OFF;
-        down_w_off = DOWN_W_OFF;  down_s_off = DOWN_S_OFF;  down_b_off = DOWN_B_OFF;
-    }
-    id<MTLComputePipelineState> expert_pipe = expert_dequant_pipe(ctx);
-    uint32_t gate_up_out = MOE_INTERMEDIATE;
-    uint32_t gate_up_in  = HIDDEN_DIM;
-    uint32_t down_out    = HIDDEN_DIM;
-    uint32_t down_in     = MOE_INTERMEDIATE;
-    uint32_t gs          = GROUP_SIZE;
-
-    // gate_proj
-    {
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + gate_w_off  atIndex:0];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + gate_s_off  atIndex:1];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + gate_b_off  atIndex:2];
-        [enc setBuffer:ctx->buf_multi_expert_input     offset:0           atIndex:3];
-        [enc setBuffer:ctx->buf_multi_expert_gate[k]   offset:0           atIndex:4];
-        [enc setBytes:&gate_up_out length:4 atIndex:5];
-        [enc setBytes:&gate_up_in  length:4 atIndex:6];
-        [enc setBytes:&gs          length:4 atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((gate_up_out + 7) / 8, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
-    }
-    // up_proj
-    {
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + up_w_off  atIndex:0];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + up_s_off  atIndex:1];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + up_b_off  atIndex:2];
-        [enc setBuffer:ctx->buf_multi_expert_input     offset:0          atIndex:3];
-        [enc setBuffer:ctx->buf_multi_expert_up[k]     offset:0          atIndex:4];
-        [enc setBytes:&gate_up_out length:4 atIndex:5];
-        [enc setBytes:&gate_up_in  length:4 atIndex:6];
-        [enc setBytes:&gs          length:4 atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((gate_up_out + 7) / 8, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
-    }
-    // SwiGLU
-    {
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:ctx->swiglu];
-        [enc setBuffer:ctx->buf_multi_expert_gate[k] offset:0 atIndex:0];
-        [enc setBuffer:ctx->buf_multi_expert_up[k]   offset:0 atIndex:1];
-        [enc setBuffer:ctx->buf_multi_expert_act[k]  offset:0 atIndex:2];
-        [enc setBytes:&gate_up_out length:4 atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake((gate_up_out + 255) / 256, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [enc endEncoding];
-    }
-    // down_proj
-    {
-        id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + down_w_off  atIndex:0];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + down_s_off  atIndex:1];
-        [enc setBuffer:layer_buf                       offset:expert_base_off + down_b_off  atIndex:2];
-        [enc setBuffer:ctx->buf_multi_expert_act[k]    offset:0           atIndex:3];
-        [enc setBuffer:ctx->buf_multi_expert_out[k]    offset:0           atIndex:4];
-        [enc setBytes:&down_out length:4 atIndex:5];
-        [enc setBytes:&down_in  length:4 atIndex:6];
-        [enc setBytes:&gs       length:4 atIndex:7];
-        [enc dispatchThreadgroups:MTLSizeMake((down_out + 7) / 8, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     }
@@ -3304,20 +3207,6 @@ static void *io_pool_worker(void *arg) {
                     t->result = (ssize_t)dec;
                 } else {
                     t->result = -1;
-                }
-            } else if (t->mmap_base && !t->dst) {
-                // mlock: wire pages into RAM (forces bulk page-in, guarantees residency for GPU)
-                void *src = (char *)t->mmap_base + t->offset;
-                if (mlock(src, t->size) == 0) {
-                    t->result = (ssize_t)t->size;
-                } else {
-                    // Fallback: touch pages manually
-                    madvise(src, t->size, MADV_WILLNEED);
-                    volatile char touch __attribute__((unused));
-                    for (size_t p = 0; p < t->size; p += 16384) {
-                        touch = ((const char *)src)[p];
-                    }
-                    t->result = (ssize_t)t->size;
                 }
             } else if (t->mmap_base) {
                 // mmap path: prefault expert range then memcpy
@@ -5748,28 +5637,6 @@ static void fused_layer_forward(
             for (int k = 0; k < actual_K; k++) {
                 valid[k] = (tasks[k].result == (ssize_t)esz);
             }
-        } else if (g_expert_metal_bufs) {
-            // ---- Zero-copy per-expert mmap path ----
-            // Parallel touch: fault in expert pages across I/O threads (no memcpy).
-            // Each expert has its own mmap region — no MADV_RANDOM conflict,
-            // kernel readahead fills the whole expert on first fault.
-            size_t esz = active_expert_size();
-            InferPreadTask tasks[MAX_K];
-            for (int k = 0; k < actual_K; k++) {
-                int idx = layer_idx * NUM_EXPERTS + expert_indices[k];
-                tasks[k].fd = packed_fd;
-                tasks[k].dst = NULL;  // NULL dst = touch-only mode
-                tasks[k].offset = 0;  // offset within the per-expert mmap
-                tasks[k].size = esz;
-                tasks[k].result = 0;
-                tasks[k].mmap_base = g_expert_mmaps[idx];
-                tasks[k].lz4_comp_buf = NULL;
-                tasks[k].lz4_comp_size = 0;
-            }
-            io_pool_dispatch(tasks, actual_K);
-            for (int k = 0; k < actual_K; k++) {
-                valid[k] = (tasks[k].result == (ssize_t)esz);
-            }
         } else {
             // ---- No cache, no prediction, no LZ4: ASYNC parallel pread ----
             async_pread_start(packed_fd, expert_indices, actual_K,
@@ -5786,23 +5653,12 @@ static void fused_layer_forward(
         memcpy([g_metal->buf_shared_up contents], shared_up,
                SHARED_INTERMEDIATE * sizeof(float));
 
-        // ---- Per-expert CMD: submit GPU work ----
-        int use_zerocopy = (g_expert_metal_bufs != NULL);
-
-        if (use_zerocopy) {
-            // Zero-copy: dispatch directly from per-expert mmap Metal buffers
-            for (int k = 0; k < actual_K; k++) {
-                if (valid[k]) {
-                    int idx = layer_idx * NUM_EXPERTS + expert_indices[k];
-                    id<MTLBuffer> ebuf = g_expert_metal_bufs[idx];
-                    if (ebuf) {
-                        id<MTLCommandBuffer> cmd_k = [g_metal->queue commandBuffer];
-                        gpu_encode_expert_forward_slot_buf(g_metal, cmd_k, k, ebuf);
-                        [cmd_k commit];
-                    }
-                }
-            }
-        } else if (!pred_started && g_async_pread.active) {
+        // ---- Per-expert CMD: submit GPU work as each pread completes ----
+        // Each expert gets its own command buffer, committed immediately.
+        // GPU starts processing cached experts while cold ones still read from SSD.
+        // The combine CMD (cmd_experts below) runs after all per-expert CMDs
+        // due to Metal command queue serialization.
+        if (!pred_started && g_async_pread.active) {
             int encoded[MAX_K] = {0};
             int num_encoded = 0;
             while (num_encoded < actual_K) {
@@ -7314,47 +7170,33 @@ int main(int argc, char **argv) {
         // Reset the global seen-expert bitset
         memset(g_expert_seen, 0, (size_t)NUM_LAYERS * ((NUM_EXPERTS + 7) / 8) * sizeof(uint8_t));
 
-        // Allocate per-expert mmap arrays
-        size_t esz = active_expert_size();
-        size_t esz_aligned = (esz + 16383) & ~(size_t)16383;
-        int total_experts = NUM_LAYERS * NUM_EXPERTS;
-        g_expert_mmaps = calloc(total_experts, sizeof(void *));
-        g_expert_metal_bufs = (__strong id<MTLBuffer> *)calloc(total_experts, sizeof(id<MTLBuffer>));
-        int expert_mmap_count = 0;
-
         for (int i = 0; i < NUM_LAYERS; i++) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);
             layer_fds[i] = open(path, O_RDONLY);
-            layer_fds_cold[i] = -1;
+            layer_fds_cold[i] = -1;  // no longer used (trust OS page cache)
             layer_mmaps[i] = MAP_FAILED;
             layer_mmap_sizes[i] = 0;
             if (layer_fds[i] >= 0) {
                 expert_layers_available++;
-                // Per-expert mmap: each expert gets its own region.
-                // No MADV_RANDOM needed — each region is exactly one expert,
-                // so default readahead fills the entire expert on first fault.
-                for (int e = 0; e < NUM_EXPERTS; e++) {
-                    off_t offset = (off_t)e * esz;
-                    void *ptr = mmap(NULL, esz_aligned, PROT_READ, MAP_SHARED, layer_fds[i], offset);
-                    if (ptr != MAP_FAILED) {
-                        int idx = i * NUM_EXPERTS + e;
-                        g_expert_mmaps[idx] = ptr;
-                        if (g_metal) {
-                            g_expert_metal_bufs[idx] =
-                                [g_metal->device newBufferWithBytesNoCopy:ptr
-                                                                  length:esz_aligned
-                                                                 options:MTLResourceStorageModeShared
-                                                             deallocator:nil];
-                        }
-                        expert_mmap_count++;
+                // Disable readahead: expert reads are random (different offsets per token).
+                // Read-ahead prefetches adjacent data we won't use, wasting SSD bandwidth.
+                fcntl(layer_fds[i], F_RDAHEAD, 0);
+                struct stat st;
+                if (fstat(layer_fds[i], &st) == 0 && st.st_size > 0) {
+                    layer_mmaps[i] = mmap(NULL, st.st_size, PROT_READ, MAP_SHARED, layer_fds[i], 0);
+                    if (layer_mmaps[i] != MAP_FAILED) {
+                        layer_mmap_sizes[i] = st.st_size;
+                        // MADV_RANDOM: tell kernel expert access is random, disable readahead.
+                        // Previously tested on M3 Max/397B and found to hurt — re-testing
+                        // on M4 Pro with smaller experts (1.7 MB vs 7 MB).
+                        madvise(layer_mmaps[i], st.st_size, MADV_RANDOM);
                     }
                 }
             }
         }
-        printf("[experts] %d/%d packed layer files, %d/%d expert mmaps (zero-copy)\n",
-               expert_layers_available, NUM_LAYERS, expert_mmap_count, total_experts);
+        printf("[experts] %d/%d packed layer files available (mmap'd)\n", expert_layers_available, NUM_LAYERS);
 
         // ---- LZ4 compressed experts: auto-detect and load ----
         {
