@@ -26,17 +26,26 @@ import os
 import time
 import sys
 
-def compute_expert_layout(hidden_dim, moe_intermediate, group_size, bits):
-    """Compute expert component layout from model dimensions."""
-    epk = 32 // bits  # elements per packed uint32
+def compute_expert_layout(hidden_dim, moe_intermediate, group_size, bits, down_bits=None):
+    """Compute expert component layout from model dimensions.
 
-    # gate/up: [mid, in_dim] -> packed [mid, in_dim/epk] uint32
-    w_size = moe_intermediate * (hidden_dim // epk) * 4
-    # scales/biases: [mid, in_dim/gs] bf16
+    Args:
+        bits: bit width for gate_proj and up_proj (default quantization)
+        down_bits: bit width for down_proj (defaults to `bits` if not specified)
+    """
+    if down_bits is None:
+        down_bits = bits
+
+    # gate/up: [mid, in_dim] -> packed [mid, in_dim * bits / 32] uint32
+    # Uses bits*in_dim/32 which handles non-power-of-2 bit widths (5, 6, etc.)
+    gate_up_packed_cols = hidden_dim * bits // 32
+    w_size = moe_intermediate * gate_up_packed_cols * 4
+    # scales/biases: [mid, in_dim/gs] bf16 (independent of bit width)
     sb_size = moe_intermediate * (hidden_dim // group_size) * 2
 
-    # down: [in_dim, mid] -> packed [in_dim, mid/epk] uint32
-    dw_size = hidden_dim * (moe_intermediate // epk) * 4
+    # down: [in_dim, mid] -> packed [in_dim, mid * down_bits / 32] uint32
+    down_packed_cols = moe_intermediate * down_bits // 32
+    dw_size = hidden_dim * down_packed_cols * 4
     dsb_size = hidden_dim * (moe_intermediate // group_size) * 2
 
     off = 0
@@ -255,7 +264,15 @@ def main():
     if args.config:
         with open(args.config) as f:
             raw_cfg = json.load(f)
-        qcfg = raw_cfg.get("quantization_config", {})
+        # Prefer "quantization" key (MLX-node), fall back to "quantization_config"
+        qcfg_raw = raw_cfg.get("quantization", raw_cfg.get("quantization_config", {}))
+        qcfg = {}
+        per_tensor_quant = {}
+        for key, val in qcfg_raw.items():
+            if isinstance(val, dict):
+                per_tensor_quant[key] = val
+            elif key in ('bits', 'group_size', 'mode'):
+                qcfg[key] = val
         cfg = raw_cfg.get("text_config", raw_cfg)
         HIDDEN_DIM = cfg.get("hidden_size", HIDDEN_DIM)
         MOE_INTERMEDIATE = cfg.get("moe_intermediate_size", MOE_INTERMEDIATE)
@@ -263,10 +280,20 @@ def main():
         BITS = qcfg.get("bits", cfg.get("quantization_bits", BITS))
         NUM_EXPERTS = cfg.get("num_experts", NUM_EXPERTS)
         NUM_LAYERS = cfg.get("num_hidden_layers", NUM_LAYERS)
-        COMPONENTS, EXPERT_SIZE = compute_expert_layout(HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS)
+
+        # Detect per-projection bit widths for mixed-precision (Unsloth Dynamic)
+        # Look for switch_mlp.down_proj override — gate/up use global default
+        down_bits = BITS
+        for key, val in per_tensor_quant.items():
+            if 'switch_mlp.down_proj' in key:
+                down_bits = val.get('bits', BITS)
+                break
+        COMPONENTS, EXPERT_SIZE = compute_expert_layout(
+            HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, BITS, down_bits=down_bits)
         LAYER_SIZE = NUM_EXPERTS * EXPERT_SIZE
+        bits_str = f"gate/up={BITS}, down={down_bits}" if down_bits != BITS else str(BITS)
         print(f"Config: hidden={HIDDEN_DIM}, intermediate={MOE_INTERMEDIATE}, "
-              f"experts={NUM_EXPERTS}, layers={NUM_LAYERS}, bits={BITS}")
+              f"experts={NUM_EXPERTS}, layers={NUM_LAYERS}, bits={bits_str}")
         print(f"Expert size: {EXPERT_SIZE} bytes")
 
     print("Loading expert index...")

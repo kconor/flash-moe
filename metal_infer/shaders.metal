@@ -10,11 +10,12 @@
  *   5. weighted_sum: combine expert outputs with routing weights
  *   6. rms_norm: RMS normalization
  *
- * Quantization format (MLX affine 4-bit, group_size=64):
- *   - Weights stored as uint32, each holding 8 x 4-bit values
+ * Quantization format (MLX affine N-bit, group_size=64):
+ *   - Weights stored as uint32, packed sequentially in bit order
+ *   - For N-bit: each group of 64 values → 64*N/32 uint32 words
  *   - Per-group scale and bias in bfloat16
- *   - Dequantized value = uint4_val * scale + bias
- *   - Groups of 64 elements share one (scale, bias) pair
+ *   - Dequantized value = uintN_val * scale + bias
+ *   - Supports 2, 4, 5, 6, 8-bit (5/6-bit values may straddle uint32 boundaries)
  *
  * Matrix layout for expert projections:
  *   gate_proj/up_proj: [1024, 512] uint32 = [1024, 4096] logical (out=1024, in=4096)
@@ -623,6 +624,275 @@ kernel void dequant_matvec_8bit_fast(
 
 
 // ============================================================================
+// Kernel 1h: 6-bit affine dequant matvec (shared memory, for in_dim <= 4096)
+// ============================================================================
+// MLX affine 6-bit, group_size=64: 64 values × 6 bits = 384 bits = 12 uint32s per group.
+// Values are packed sequentially in bit order within each group. Some values straddle
+// uint32 boundaries (values 5 and 10 within each 16-value chunk).
+// packed_cols = in_dim * 6 / 32 per row.
+
+kernel void dequant_matvec_6bit(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size * 6 / 32;
+    uint packed_cols = num_groups * packed_per_group;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    // Iterate per-value for maximum SIMD utilization
+    for (uint val_idx = simd_lane; val_idx < in_dim; val_idx += 32) {
+        uint g = val_idx / group_size;
+        uint within = val_idx - g * group_size;
+
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint bit_pos = within * 6;
+        uint word = g * packed_per_group + (bit_pos >> 5);
+        uint bit  = bit_pos & 31;
+
+        uint val = (w_row[word] >> bit);
+        if (bit + 6 > 32) {
+            val |= (w_row[word + 1] << (32 - bit));
+        }
+        val &= 0x3F;
+
+        acc += (float(val) * scale + bias) * x_shared[val_idx];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// 6-bit variant for in_dim > 4096 (no shared memory cache, group-based iteration)
+kernel void dequant_matvec_6bit_fast(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= out_dim) return;
+
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size * 6 / 32;
+    uint packed_cols = num_groups * packed_per_group;
+
+    device const uint32_t* w_row = W_packed + tgid * packed_cols;
+    device const uint16_t* s_row = scales + tgid * num_groups;
+    device const uint16_t* b_row = biases + tgid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = lid; g < num_groups; g += tg_size) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint base_packed = g * packed_per_group;
+        uint base_x = g * group_size;
+
+        for (uint i = 0; i < group_size; i++) {
+            uint bit_pos = i * 6;
+            uint word = bit_pos >> 5;
+            uint bit  = bit_pos & 31;
+
+            uint val = (w_row[base_packed + word] >> bit);
+            if (bit + 6 > 32) {
+                val |= (w_row[base_packed + word + 1] << (32 - bit));
+            }
+            val &= 0x3F;
+            acc += (float(val) * scale + bias) * x[base_x + i];
+        }
+    }
+
+    threadgroup float shared[32];
+    float simd_val = simd_sum(acc);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = shared[simd_lane];
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[tgid] = val;
+        }
+    }
+}
+
+
+// ============================================================================
+// Kernel 1i: 5-bit affine dequant matvec (shared memory, for in_dim <= 4096)
+// ============================================================================
+// MLX affine 5-bit, group_size=64: 64 values × 5 bits = 320 bits = 10 uint32s per group.
+// Values are packed sequentially in bit order. Straddles occur at values 6, 12, 19, 25
+// within each 32-value chunk (since LCM(5,32) = 160 bits = 32 values, 5 words).
+// packed_cols = in_dim * 5 / 32 per row.
+
+kernel void dequant_matvec_5bit(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size * 5 / 32;
+    uint packed_cols = num_groups * packed_per_group;
+
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint32_t* w_row = W_packed + row * packed_cols;
+    device const uint16_t* s_row = scales + row * num_groups;
+    device const uint16_t* b_row = biases + row * num_groups;
+
+    float acc = 0.0f;
+
+    for (uint val_idx = simd_lane; val_idx < in_dim; val_idx += 32) {
+        uint g = val_idx / group_size;
+        uint within = val_idx - g * group_size;
+
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint bit_pos = within * 5;
+        uint word = g * packed_per_group + (bit_pos >> 5);
+        uint bit  = bit_pos & 31;
+
+        uint val = (w_row[word] >> bit);
+        if (bit + 5 > 32) {
+            val |= (w_row[word + 1] << (32 - bit));
+        }
+        val &= 0x1F;
+
+        acc += (float(val) * scale + bias) * x_shared[val_idx];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// 5-bit variant for in_dim > 4096 (no shared memory cache)
+kernel void dequant_matvec_5bit_fast(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= out_dim) return;
+
+    uint num_groups = in_dim / group_size;
+    uint packed_per_group = group_size * 5 / 32;
+    uint packed_cols = num_groups * packed_per_group;
+
+    device const uint32_t* w_row = W_packed + tgid * packed_cols;
+    device const uint16_t* s_row = scales + tgid * num_groups;
+    device const uint16_t* b_row = biases + tgid * num_groups;
+
+    float acc = 0.0f;
+    for (uint g = lid; g < num_groups; g += tg_size) {
+        float scale = bf16_to_f32(s_row[g]);
+        float bias  = bf16_to_f32(b_row[g]);
+
+        uint base_packed = g * packed_per_group;
+        uint base_x = g * group_size;
+
+        for (uint i = 0; i < group_size; i++) {
+            uint bit_pos = i * 5;
+            uint word = bit_pos >> 5;
+            uint bit  = bit_pos & 31;
+
+            uint val = (w_row[base_packed + word] >> bit);
+            if (bit + 5 > 32) {
+                val |= (w_row[base_packed + word + 1] << (32 - bit));
+            }
+            val &= 0x1F;
+            acc += (float(val) * scale + bias) * x[base_x + i];
+        }
+    }
+
+    threadgroup float shared[32];
+    float simd_val = simd_sum(acc);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = shared[simd_lane];
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[tgid] = val;
+        }
+    }
+}
+
+
+// ============================================================================
 // Kernel 1d: FULLY OPTIMIZED with uint4 vector loads
 // ============================================================================
 //
@@ -786,6 +1056,88 @@ kernel void dequant_matvec_4bit_batched(
     float sum = simd_sum(acc);
     if (simd_lane == 0) {
         out[expert_k * out_dim + row] = sum;
+    }
+}
+
+
+// ============================================================================
+// Kernel 1j: BF16 (unquantized) matrix-vector multiply
+// ============================================================================
+// For tensors stored in raw BF16 (e.g. o_proj, out_proj in mixed-precision models).
+// No dequantization needed — just bf16→f32 conversion and dot product.
+// W: [out_dim, in_dim] stored as uint16 (bf16 bit pattern)
+
+kernel void bf16_matvec(
+    device const uint16_t* W        [[buffer(0)]],
+    device const float*    x        [[buffer(1)]],
+    device float*          out      [[buffer(2)]],
+    constant uint&         out_dim  [[buffer(3)]],
+    constant uint&         in_dim   [[buffer(4)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    uint row = tgid * ROWS_PER_TG + simd_group;
+
+    threadgroup float x_shared[8192];
+    for (uint i = lid; i < in_dim; i += 256) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if (row >= out_dim) return;
+
+    device const uint16_t* w_row = W + row * in_dim;
+
+    float acc = 0.0f;
+    for (uint col = simd_lane; col < in_dim; col += 32) {
+        acc += bf16_to_f32(w_row[col]) * x_shared[col];
+    }
+
+    float sum = simd_sum(acc);
+    if (simd_lane == 0) {
+        out[row] = sum;
+    }
+}
+
+// BF16 matvec for in_dim > 8192 (no shared memory)
+kernel void bf16_matvec_fast(
+    device const uint16_t* W        [[buffer(0)]],
+    device const float*    x        [[buffer(1)]],
+    device float*          out      [[buffer(2)]],
+    constant uint&         out_dim  [[buffer(3)]],
+    constant uint&         in_dim   [[buffer(4)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= out_dim) return;
+
+    device const uint16_t* w_row = W + tgid * in_dim;
+
+    float acc = 0.0f;
+    for (uint col = lid; col < in_dim; col += tg_size) {
+        acc += bf16_to_f32(w_row[col]) * x[col];
+    }
+
+    threadgroup float shared[32];
+    float simd_val = simd_sum(acc);
+
+    uint simd_lane = lid % 32;
+    uint simd_group = lid / 32;
+    uint num_simd_groups = (tg_size + 31) / 32;
+
+    if (simd_lane == 0) {
+        shared[simd_group] = simd_val;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (simd_group == 0 && simd_lane < num_simd_groups) {
+        float val = shared[simd_lane];
+        val = simd_sum(val);
+        if (simd_lane == 0) {
+            out[tgid] = val;
+        }
     }
 }
 

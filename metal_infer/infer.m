@@ -365,6 +365,7 @@ typedef struct {
     int ndim;
     int shape[4];
     char dtype[8];  // "U32", "BF16", "F32"
+    int bits;       // per-tensor quantization bits (0 = use g_cfg->bits default)
 } TensorInfo;
 
 typedef struct {
@@ -420,6 +421,10 @@ static TensorManifest *load_manifest(const char *json_path) {
 
             const char *dtype = [info[@"dtype"] UTF8String];
             strncpy(t->dtype, dtype, 7);
+
+            // Per-tensor quantization bits (mixed-precision models)
+            NSNumber *bits_val = info[@"bits"];
+            t->bits = bits_val ? [bits_val intValue] : 0;
 
             m->num_tensors++;
         }
@@ -486,6 +491,7 @@ static ModelConfig *load_model_config(const char *json_path) {
         CFG_FLOAT(rope_theta,        "rope_theta",                    10000000.0f);
         CFG_INT(group_size,          "group_size",                     64);
         CFG_INT(bits,                "quantization_bits",              4);
+        CFG_INT(down_bits,           "expert_down_bits",               0);  // 0 = same as bits
         CFG_INT(eos_token_1,         "eos_token_1",                   248046);
         CFG_INT(eos_token_2,         "eos_token_2",                   248044);
         CFG_INT(think_start_token,   "think_start_token",             248068);
@@ -648,6 +654,20 @@ static void *get_tensor_ptr_required(WeightFile *wf, const char *name) {
 
 static TensorInfo *get_tensor_info(WeightFile *wf, const char *name) {
     return find_tensor(wf->manifest, name);
+}
+
+// Get per-tensor quantization bits (0 = use default g_cfg->bits, 16 = bf16 unquantized)
+static int get_tensor_bits(WeightFile *wf, const char *name) {
+    TensorInfo *t = find_tensor(wf->manifest, name);
+    if (!t) return 0;
+    if (t->bits > 0) return t->bits;
+    // Detect BF16 unquantized tensors: dtype is BF16 and no companion .scales tensor
+    if (strcmp(t->dtype, "BF16") == 0 && t->ndim == 2) {
+        // Check if this is a weight tensor (not a scales/biases tensor)
+        // Weight tensors that are BF16 with 2D shape are unquantized projections
+        return 16;
+    }
+    return 0;
 }
 
 // ============================================================================
@@ -840,10 +860,10 @@ static void cpu_dequant_matvec_bits(
     int out_dim, int in_dim, int group_size, int bits
 ) {
     int num_groups = in_dim / group_size;
-    int vals_per_u32 = 32 / bits;
-    int packed_per_group = group_size / vals_per_u32;
-    int packed_cols = in_dim / vals_per_u32;
     uint32_t mask = (1u << bits) - 1;
+    int clean_packing = (32 % bits == 0);  // 2, 4, 8 divide 32 cleanly
+    int packed_per_group = group_size * bits / 32;
+    int packed_cols = num_groups * packed_per_group;
 
     for (int row = 0; row < out_dim; row++) {
         float acc = 0.0f;
@@ -857,13 +877,28 @@ static void cpu_dequant_matvec_bits(
             int base_packed = g * packed_per_group;
             int base_x = g * group_size;
 
-            for (int p = 0; p < packed_per_group; p++) {
-                uint32_t packed = w_row[base_packed + p];
-                int x_base = base_x + p * vals_per_u32;
-
-                for (int n = 0; n < vals_per_u32; n++) {
-                    uint32_t val = (packed >> (n * bits)) & mask;
-                    acc += ((float)val * scale + bias) * x[x_base + n];
+            if (clean_packing) {
+                // Fast path: 2, 4, 8-bit — no straddling
+                int vals_per_u32 = 32 / bits;
+                for (int p = 0; p < packed_per_group; p++) {
+                    uint32_t packed = w_row[base_packed + p];
+                    int x_base = base_x + p * vals_per_u32;
+                    for (int n = 0; n < vals_per_u32; n++) {
+                        uint32_t val = (packed >> (n * bits)) & mask;
+                        acc += ((float)val * scale + bias) * x[x_base + n];
+                    }
+                }
+            } else {
+                // Generic path: 3, 5, 6, 7-bit — values may straddle uint32 boundaries
+                const uint32_t *gw = w_row + base_packed;
+                for (int i = 0; i < group_size; i++) {
+                    int bit_pos = i * bits;
+                    int word = bit_pos >> 5;
+                    int bit = bit_pos & 31;
+                    uint32_t val = (gw[word] >> bit);
+                    if (bit + bits > 32) val |= (gw[word + 1] << (32 - bit));
+                    val &= mask;
+                    acc += ((float)val * scale + bias) * x[base_x + i];
                 }
             }
         }
@@ -1054,6 +1089,12 @@ typedef struct {
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_8bit;  // 8-bit expert dequant kernel
     id<MTLComputePipelineState> matvec_8bit_fast; // 8-bit for in_dim > 4096
+    id<MTLComputePipelineState> matvec_6bit;      // 6-bit dequant kernel
+    id<MTLComputePipelineState> matvec_6bit_fast; // 6-bit for in_dim > 4096
+    id<MTLComputePipelineState> matvec_5bit;      // 5-bit dequant kernel
+    id<MTLComputePipelineState> matvec_5bit_fast; // 5-bit for in_dim > 4096
+    id<MTLComputePipelineState> matvec_bf16;      // BF16 unquantized matvec
+    id<MTLComputePipelineState> matvec_bf16_fast; // BF16 for in_dim > 8192
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
@@ -1197,6 +1238,12 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
     ctx->matvec_8bit      = makePipe(@"dequant_matvec_8bit");
     ctx->matvec_8bit_fast = makePipe(@"dequant_matvec_8bit_fast");
+    ctx->matvec_6bit      = makePipe(@"dequant_matvec_6bit");
+    ctx->matvec_6bit_fast = makePipe(@"dequant_matvec_6bit_fast");
+    ctx->matvec_5bit      = makePipe(@"dequant_matvec_5bit");
+    ctx->matvec_5bit_fast = makePipe(@"dequant_matvec_5bit_fast");
+    ctx->matvec_bf16      = makePipe(@"bf16_matvec");
+    ctx->matvec_bf16_fast = makePipe(@"bf16_matvec_fast");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
@@ -1395,11 +1442,30 @@ static void reset_delta_net_state(void) {
     }
 }
 
-// Select the correct dequant pipeline based on active quantization
+// Select the correct dequant pipeline for a given bit width and in_dim
+static inline id<MTLComputePipelineState> select_dequant_pipe(MetalCtx *ctx, int bits, int in_dim) {
+    int use_small = (in_dim <= 4096);
+    switch (bits) {
+        case 2:  return ctx->matvec_2bit;
+        case 5:  return use_small ? ctx->matvec_5bit : ctx->matvec_5bit_fast;
+        case 6:  return use_small ? ctx->matvec_6bit : ctx->matvec_6bit_fast;
+        case 8:  return use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
+        case 16: return (in_dim <= 8192) ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
+        default: return use_small ? ctx->matvec_v3   : ctx->matvec_fast;  // 4-bit
+    }
+}
+
+// Select the correct dequant pipeline based on active quantization (expert path)
 static inline id<MTLComputePipelineState> expert_dequant_pipe(MetalCtx *ctx) {
     if (g_use_2bit) return ctx->matvec_2bit;
-    if (g_cfg->bits == 8) return ctx->matvec_8bit;
-    return ctx->matvec_v3;  // 4-bit default
+    return select_dequant_pipe(ctx, g_cfg->bits, HIDDEN_DIM);
+}
+
+// Select pipeline for expert down_proj (may differ in mixed-precision models)
+static inline id<MTLComputePipelineState> expert_down_dequant_pipe(MetalCtx *ctx) {
+    if (g_use_2bit) return ctx->matvec_2bit;
+    int db = g_cfg->down_bits > 0 ? g_cfg->down_bits : g_cfg->bits;
+    return select_dequant_pipe(ctx, db, MOE_INTERMEDIATE);
 }
 
 // Wrap the mmap'd weight file as a Metal buffer (zero-copy on unified memory)
@@ -1432,11 +1498,11 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
 // We wrap the ENTIRE mmap'd weight file as a single Metal buffer and use
 // byte offsets to point each shader argument at the right tensor.
 // This avoids per-tensor buffer creation and the page-alignment constraint.
-static void gpu_dequant_matvec(
+static void gpu_dequant_matvec_ex(
     MetalCtx *ctx,
     const void *W_packed, const void *scales, const void *biases,
     const float *x_f32, float *out_f32,
-    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size, int bits
 ) {
     // Copy input to Metal buffer
     memcpy([ctx->buf_input contents], x_f32, in_dim * sizeof(float));
@@ -1457,23 +1523,30 @@ static void gpu_dequant_matvec(
     id<MTLCommandBuffer> cmdbuf = [ctx->queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
 
-    // v3 shader uses x_shared[4096], so can only handle in_dim <= 4096
-    // For larger in_dim (e.g. o_proj with in_dim=8192), use matvec_fast
-    int use_small = (in_dim <= 4096);
-    id<MTLComputePipelineState> pipe;
-    if (g_cfg->bits == 8)
-        pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
-    else
-        pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
+    int use_small;
+    id<MTLComputePipelineState> pipe = select_dequant_pipe(ctx, bits, in_dim);
     [enc setComputePipelineState: pipe];
-    [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
-    [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
-    [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
-    [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
-    [enc setBuffer:o_buf        offset:0     atIndex:4];
-    [enc setBytes:&out_dim      length:4     atIndex:5];
-    [enc setBytes:&in_dim       length:4     atIndex:6];
-    [enc setBytes:&group_size   length:4     atIndex:7];
+
+    if (bits == 16) {
+        // BF16 unquantized: different buffer layout (W, x, out, out_dim, in_dim)
+        use_small = (in_dim <= 8192);
+        [enc setBuffer:ctx->wf_buf    offset:w_off atIndex:0];
+        [enc setBuffer:ctx->buf_input offset:0     atIndex:1];
+        [enc setBuffer:o_buf          offset:0     atIndex:2];
+        [enc setBytes:&out_dim        length:4     atIndex:3];
+        [enc setBytes:&in_dim         length:4     atIndex:4];
+    } else {
+        // Quantized: W, scales, biases, x, out, out_dim, in_dim, group_size
+        use_small = (in_dim <= 4096);
+        [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
+        [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
+        [enc setBuffer:ctx->wf_buf  offset:b_off atIndex:2];
+        [enc setBuffer:ctx->buf_input offset:0   atIndex:3];
+        [enc setBuffer:o_buf        offset:0     atIndex:4];
+        [enc setBytes:&out_dim      length:4     atIndex:5];
+        [enc setBytes:&in_dim       length:4     atIndex:6];
+        [enc setBytes:&group_size   length:4     atIndex:7];
+    }
 
     if (use_small) {
         // v3: tiled threadgroups, 256 threads, 8 rows per TG
@@ -1494,18 +1567,65 @@ static void gpu_dequant_matvec(
     memcpy(out_f32, [o_buf contents], o_size);
 }
 
+// Backwards-compatible wrapper using g_cfg->bits
+static void gpu_dequant_matvec(
+    MetalCtx *ctx,
+    const void *W_packed, const void *scales, const void *biases,
+    const float *x_f32, float *out_f32,
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+) {
+    gpu_dequant_matvec_ex(ctx, W_packed, scales, biases, x_f32, out_f32,
+                          out_dim, in_dim, group_size, g_cfg->bits);
+}
+
+// CPU bf16 matvec: out[out_dim] = W_bf16[out_dim, in_dim] * x[in_dim]
+static void cpu_bf16_matvec(
+    const uint16_t *W, const float *x, float *out, int out_dim, int in_dim
+) {
+    for (int row = 0; row < out_dim; row++) {
+        const uint16_t *w_row = W + row * in_dim;
+        float acc = 0.0f;
+        for (int col = 0; col < in_dim; col++) {
+            acc += bf16_to_f32(w_row[col]) * x[col];
+        }
+        out[row] = acc;
+    }
+}
+
 // Wrapper: use GPU if available and weight buffer is set, CPU otherwise
+// bits=0 means use g_cfg->bits default, bits=16 means BF16 unquantized
+static void fast_dequant_matvec_ex(
+    const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
+    const float *x, float *out,
+    int out_dim, int in_dim, int group_size, int bits
+) {
+    int eff_bits = bits > 0 ? bits : g_cfg->bits;
+    if (eff_bits == 16) {
+        // BF16 unquantized path
+        if (g_metal && g_metal->wf_buf) {
+            gpu_dequant_matvec_ex(g_metal, W, scales, biases, x, out,
+                                  (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size,
+                                  16);
+        } else {
+            cpu_bf16_matvec((const uint16_t *)W, x, out, out_dim, in_dim);
+        }
+    } else if (g_metal && g_metal->wf_buf) {
+        gpu_dequant_matvec_ex(g_metal, W, scales, biases, x, out,
+                              (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size,
+                              eff_bits);
+    } else {
+        cpu_dequant_matvec_bits(W, scales, biases, x, out, out_dim, in_dim, group_size,
+                                eff_bits);
+    }
+}
+
+// Backwards-compatible wrapper using g_cfg->bits
 static void fast_dequant_matvec(
     const uint32_t *W, const uint16_t *scales, const uint16_t *biases,
     const float *x, float *out,
     int out_dim, int in_dim, int group_size
 ) {
-    if (g_metal && g_metal->wf_buf) {
-        gpu_dequant_matvec(g_metal, W, scales, biases, x, out,
-                           (uint32_t)out_dim, (uint32_t)in_dim, (uint32_t)group_size);
-    } else {
-        cpu_dequant_matvec(W, scales, biases, x, out, out_dim, in_dim, group_size);
-    }
+    fast_dequant_matvec_ex(W, scales, biases, x, out, out_dim, in_dim, group_size, 0);
 }
 
 // ============================================================================
@@ -1548,11 +1668,7 @@ static void gpu_batch_matvec(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int spec_bits = s->bits > 0 ? s->bits : g_cfg->bits;
         int use_small = (s->in_dim <= 4096);
-        id<MTLComputePipelineState> mv_pipe;
-        if (spec_bits == 8)
-            mv_pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
-        else
-            mv_pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
+        id<MTLComputePipelineState> mv_pipe = select_dequant_pipe(ctx, spec_bits, s->in_dim);
         [enc setComputePipelineState: mv_pipe];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
@@ -1608,11 +1724,7 @@ static void gpu_encode_batch_matvec(
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
         int spec_bits = s->bits > 0 ? s->bits : g_cfg->bits;
         int use_small = (s->in_dim <= 4096);
-        id<MTLComputePipelineState> mv_pipe;
-        if (spec_bits == 8)
-            mv_pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
-        else
-            mv_pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
+        id<MTLComputePipelineState> mv_pipe = select_dequant_pipe(ctx, spec_bits, s->in_dim);
         [enc setComputePipelineState: mv_pipe];
         [enc setBuffer:ctx->wf_buf  offset:w_off atIndex:0];
         [enc setBuffer:ctx->wf_buf  offset:s_off atIndex:1];
@@ -1653,19 +1765,16 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     id<MTLCommandBuffer> cmdbuf,
     const void *W, const void *scales, const void *biases,
     id<MTLBuffer> in_buf, id<MTLBuffer> out_buf,
-    uint32_t out_dim, uint32_t in_dim, uint32_t group_size
+    uint32_t out_dim, uint32_t in_dim, uint32_t group_size,
+    int bits  // 0 = use g_cfg->bits
 ) {
+    int eff_bits = bits > 0 ? bits : g_cfg->bits;
     NSUInteger w_off = (NSUInteger)((const char *)W      - (const char *)[ctx->wf_buf contents]);
     NSUInteger s_off = (NSUInteger)((const char *)scales  - (const char *)[ctx->wf_buf contents]);
     NSUInteger b_off = (NSUInteger)((const char *)biases  - (const char *)[ctx->wf_buf contents]);
 
     id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-    int use_small = (in_dim <= 4096);
-    id<MTLComputePipelineState> pipe;
-    if (g_cfg->bits == 8)
-        pipe = use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
-    else
-        pipe = use_small ? ctx->matvec_v3 : ctx->matvec_fast;
+    id<MTLComputePipelineState> pipe = select_dequant_pipe(ctx, eff_bits, in_dim);
     [enc setComputePipelineState: pipe];
     [enc setBuffer:ctx->wf_buf offset:w_off atIndex:0];
     [enc setBuffer:ctx->wf_buf offset:s_off atIndex:1];
@@ -1676,6 +1785,7 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&in_dim      length:4     atIndex:6];
     [enc setBytes:&group_size  length:4     atIndex:7];
 
+    int use_small = (in_dim <= 4096);
     if (use_small) {
         uint32_t num_tgs = (out_dim + 7) / 8;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
@@ -1763,9 +1873,10 @@ static void gpu_encode_expert_forward_slot(
         [enc endEncoding];
     }
     // down_proj: act[k] -> out[k]
+    // Use separate pipeline for down_proj (may differ in mixed-precision models)
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:expert_down_dequant_pipe(ctx)];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_w_off  atIndex:0];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_s_off  atIndex:1];
         [enc setBuffer:ctx->buf_multi_expert_data[k] offset:down_b_off  atIndex:2];
@@ -1858,10 +1969,10 @@ static void gpu_encode_expert_forward_slot_buf(
             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         [enc endEncoding];
     }
-    // down_proj
+    // down_proj (may use different bit width in mixed-precision models)
     {
         id<MTLComputeCommandEncoder> enc = [cmdbuf computeCommandEncoder];
-        [enc setComputePipelineState:expert_pipe];
+        [enc setComputePipelineState:expert_down_dequant_pipe(ctx)];
         [enc setBuffer:data_buf                        offset:down_w_off  atIndex:0];
         [enc setBuffer:data_buf                        offset:down_s_off  atIndex:1];
         [enc setBuffer:data_buf                        offset:down_b_off  atIndex:2];
@@ -2078,8 +2189,9 @@ static void fast_batch_matvec(
     } else {
         for (int i = 0; i < num_specs; i++) {
             BatchMatvecSpec *s = &specs[i];
-            cpu_dequant_matvec(s->W, s->scales, s->biases, x, s->out_cpu,
-                               s->out_dim, s->in_dim, s->group_size);
+            int eff_bits = s->bits > 0 ? s->bits : g_cfg->bits;
+            cpu_dequant_matvec_bits(s->W, s->scales, s->biases, x, s->out_cpu,
+                                    s->out_dim, s->in_dim, s->group_size, eff_bits);
         }
     }
 }
@@ -2379,10 +2491,12 @@ static void full_attention_forward(
 
     // Batch Q/K/V into one command buffer (3 dispatches, 1 commit)
     if (qw && qs && qb && kw && ks && kb && vw && vs && vb) {
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", layer_idx);
+        int qkv_bits = get_tensor_bits(wf, name);
         BatchMatvecSpec qkv_specs[3] = {
-            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 },
-            { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 },
-            { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 },
+            { qw, qs, qb, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, qkv_bits },
+            { kw, ks, kb, k,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, qkv_bits },
+            { vw, vs, vb, v,          (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, qkv_bits },
         };
         fast_batch_matvec(normed, HIDDEN_DIM, qkv_specs, 3);
     }
@@ -2509,7 +2623,16 @@ static void full_attention_forward(
     uint16_t *os_ptr = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", layer_idx);
     uint16_t *ob = get_tensor_ptr(wf, name);
-    if (ow && os_ptr && ob) fast_dequant_matvec(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE);
+    if (ow) {
+        snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", layer_idx);
+        int ob_bits = get_tensor_bits(wf, name);
+        if (os_ptr && ob) {
+            fast_dequant_matvec_ex(ow, os_ptr, ob, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE, ob_bits);
+        } else {
+            // BF16 unquantized o_proj
+            fast_dequant_matvec_ex(ow, NULL, NULL, attn_out, attn_projected, HIDDEN_DIM, q_dim, GROUP_SIZE, 16);
+        }
+    }
 
     if (do_debug) {
         fprintf(stderr, "[FA-DBG] attn_out_rms=%.6f o_proj first5=[%.6f,%.6f,%.6f,%.6f,%.6f]\n",
@@ -2635,15 +2758,34 @@ static void linear_attention_forward(
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_a.biases", layer_idx);
     uint16_t *a_b = get_tensor_ptr(wf, name);
 
-    if (qkv_w && qkv_s && qkv_b && z_w && z_s && z_b &&
-        b_w && b_s && b_b && a_w && a_s && a_b) {
-        BatchMatvecSpec la_specs[4] = {
-            { qkv_w, qkv_s, qkv_b, qkv,   (uint32_t)qkv_dim,         HIDDEN_DIM, GROUP_SIZE, 0 },
-            { z_w,   z_s,   z_b,   z,      (uint32_t)z_dim,           HIDDEN_DIM, GROUP_SIZE, 1 },
-            { b_w,   b_s,   b_b,   beta,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2 },
-            { a_w,   a_s,   a_b,   alpha,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3 },
-        };
-        fast_batch_matvec(normed, HIDDEN_DIM, la_specs, 4);
+    snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", layer_idx);
+    int la_bits = get_tensor_bits(wf, name);
+
+    // Batch quantized projections (qkv, z) — skip bf16 ones from the batch
+    {
+        int n_la = 0;
+        BatchMatvecSpec la_specs[4];
+        if (qkv_w && qkv_s && qkv_b) {
+            la_specs[n_la++] = (BatchMatvecSpec){ qkv_w, qkv_s, qkv_b, qkv, (uint32_t)qkv_dim, HIDDEN_DIM, GROUP_SIZE, 0, la_bits };
+        }
+        if (z_w && z_s && z_b) {
+            la_specs[n_la++] = (BatchMatvecSpec){ z_w, z_s, z_b, z, (uint32_t)z_dim, HIDDEN_DIM, GROUP_SIZE, 1, la_bits };
+        }
+        if (b_w && b_s && b_b) {
+            la_specs[n_la++] = (BatchMatvecSpec){ b_w, b_s, b_b, beta, (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, la_bits };
+        }
+        if (a_w && a_s && a_b) {
+            la_specs[n_la++] = (BatchMatvecSpec){ a_w, a_s, a_b, alpha, (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, la_bits };
+        }
+        if (n_la > 0) fast_batch_matvec(normed, HIDDEN_DIM, la_specs, n_la);
+
+        // BF16 fallback for unquantized projections
+        if (z_w && !z_s)
+            cpu_bf16_matvec((const uint16_t *)z_w, normed, z, z_dim, HIDDEN_DIM);
+        if (b_w && !b_s)
+            cpu_bf16_matvec((const uint16_t *)b_w, normed, beta, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
+        if (a_w && !a_s)
+            cpu_bf16_matvec((const uint16_t *)a_w, normed, alpha, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
     }
 
     // ---- Conv1d step ----
@@ -2795,9 +2937,16 @@ static void linear_attention_forward(
     uint16_t *out_s = get_tensor_ptr(wf, name);
     snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", layer_idx);
     uint16_t *out_b = get_tensor_ptr(wf, name);
-    if (out_w && out_s && out_b) {
-        fast_dequant_matvec(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
-                            LINEAR_TOTAL_VALUE, GROUP_SIZE);
+    if (out_w) {
+        snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", layer_idx);
+        int out_bits = get_tensor_bits(wf, name);
+        if (out_s && out_b) {
+            fast_dequant_matvec_ex(out_w, out_s, out_b, gated_out, attn_out, HIDDEN_DIM,
+                                   LINEAR_TOTAL_VALUE, GROUP_SIZE, out_bits);
+        } else {
+            fast_dequant_matvec_ex(out_w, NULL, NULL, gated_out, attn_out, HIDDEN_DIM,
+                                   LINEAR_TOTAL_VALUE, GROUP_SIZE, 16);
+        }
     }
 
     // ---- Residual ----
@@ -2887,14 +3036,22 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", layer_idx);
     uint16_t *seg_b = get_tensor_ptr(wf, name);
 
+    // Detect per-tensor bits
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", layer_idx);
+    int moe_gate_bits = get_tensor_bits(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", layer_idx);
+    int moe_sg_bits = get_tensor_bits(wf, name);
+    snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", layer_idx);
+    int moe_seg_bits = get_tensor_bits(wf, name);
+
     // All 4 matmuls share h_post as input -- batch into one command buffer
     if (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
         suw && sus && sub && seg_w && seg_s && seg_b) {
         BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, 0 },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, 0 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, 0 },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, 0 },
+            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, moe_gate_bits },
+            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, moe_sg_bits },
+            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, moe_sg_bits },
+            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, moe_seg_bits },
         };
         fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
     }
@@ -2966,8 +3123,11 @@ static void moe_forward(
                 cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
                                    MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
                 cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-                cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out,
-                                   HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+                {
+                    int db = g_cfg->down_bits > 0 ? g_cfg->down_bits : g_cfg->bits;
+                    cpu_dequant_matvec_bits(dw, ds_p, db_p, act_out, expert_out,
+                                           HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, db);
+                }
 
                 free(gate_proj_out);
                 free(up_proj_out);
@@ -3014,8 +3174,10 @@ static void moe_forward(
     snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", layer_idx);
     uint16_t *sdb = get_tensor_ptr(wf, name);
     if (sdw && sds && sdb) {
-        fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out, HIDDEN_DIM,
-                            SHARED_INTERMEDIATE, GROUP_SIZE);
+        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", layer_idx);
+        int sd_bits = get_tensor_bits(wf, name);
+        fast_dequant_matvec_ex(sdw, sds, sdb, shared_act, shared_out, HIDDEN_DIM,
+                               SHARED_INTERMEDIATE, GROUP_SIZE, sd_bits);
     }
 
     // ---- Shared expert gate (sigmoid) -- already computed above ----
@@ -3080,25 +3242,45 @@ static void embed_lookup(WeightFile *wf, int token_id, float *out) {
     const uint16_t *s_row = S + (size_t)token_id * num_groups;
     const uint16_t *b_row = B + (size_t)token_id * num_groups;
 
+    // Detect per-tensor bits (e.g. 6-bit for embed in mixed-precision models)
+    int bits = w_info->bits > 0 ? w_info->bits : g_cfg->bits;
     int group_size = HIDDEN_DIM / num_groups;
-    int vals_per_u32 = 32 / g_cfg->bits;          // 8 for 4-bit, 4 for 8-bit
-    int packed_per_group = group_size / vals_per_u32;
-    uint32_t mask = (1u << g_cfg->bits) - 1;       // 0xF for 4-bit, 0xFF for 8-bit
+    int packed_per_group = group_size * bits / 32;
+    uint32_t mask = (1u << bits) - 1;
+    int clean_packing = (32 % bits == 0);
 
     for (int g = 0; g < num_groups; g++) {
         float scale = bf16_to_f32(s_row[g]);
         float bias = bf16_to_f32(b_row[g]);
+        int base_packed = g * packed_per_group;
+        int base_out = g * group_size;
 
-        for (int p = 0; p < packed_per_group; p++) {
-            uint32_t packed = w_row[g * packed_per_group + p];
-            int base = g * group_size + p * vals_per_u32;
-
-            for (int n = 0; n < vals_per_u32; n++) {
-                uint32_t val = (packed >> (n * g_cfg->bits)) & mask;
-                out[base + n] = (float)val * scale + bias;
+        if (clean_packing) {
+            // Fast path: 2, 4, 8-bit
+            int vals_per_u32 = 32 / bits;
+            for (int p = 0; p < packed_per_group; p++) {
+                uint32_t packed = w_row[base_packed + p];
+                int base = base_out + p * vals_per_u32;
+                for (int n = 0; n < vals_per_u32; n++) {
+                    uint32_t val = (packed >> (n * bits)) & mask;
+                    out[base + n] = (float)val * scale + bias;
+                }
+            }
+        } else {
+            // Generic path: 3, 5, 6, 7-bit — values may straddle uint32 boundaries
+            const uint32_t *gw = w_row + base_packed;
+            for (int i = 0; i < group_size; i++) {
+                int bit_pos = i * bits;
+                int word = bit_pos >> 5;
+                int bit = bit_pos & 31;
+                uint32_t val = (gw[word] >> bit);
+                if (bit + bits > 32) val |= (gw[word + 1] << (32 - bit));
+                val &= mask;
+                out[base_out + i] = (float)val * scale + bias;
             }
         }
     }
+
 }
 
 // ============================================================================
@@ -3124,7 +3306,8 @@ static void lm_head_forward(WeightFile *wf, const float *hidden, float *logits) 
     uint16_t *B = (uint16_t *)((char *)wf->data + b_info->offset);
 
     // Full matmul — use GPU if available (248320 output rows!)
-    fast_dequant_matvec(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE);
+    int lm_bits = w_info->bits;  // 0 = use g_cfg->bits default
+    fast_dequant_matvec_ex(W, S, B, hidden, logits, VOCAB_SIZE, HIDDEN_DIM, GROUP_SIZE, lm_bits);
 }
 
 // ============================================================================
@@ -3893,6 +4076,12 @@ typedef struct {
     // A_log converted to f32 (qwen3_next stores as BF16)
     float *A_log_f32;  // non-NULL if A_log was BF16 and converted
 
+    // Per-tensor quantization bits (mixed-precision models, 0 = use g_cfg->bits)
+    int attn_proj_bits;   // q/k/v/qkv/z projection bits
+    int out_proj_bits;    // o_proj / out_proj bits
+    int shared_gate_up_bits;  // shared expert gate/up bits
+    int shared_down_bits;     // shared expert down bits
+
     // MoE routing + shared expert weights
     uint32_t *gate_w; uint16_t *gate_s, *gate_b;
     int gate_bits;    // quantization bits for gate (may differ from g_cfg->bits)
@@ -3925,6 +4114,7 @@ static void build_layer_cache(WeightFile *wf) {
             // Full attention
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.weight", i);
             lc->q_w = get_tensor_ptr(wf, name);
+            lc->attn_proj_bits = get_tensor_bits(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.scales", i);
             lc->q_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.q_proj.biases", i);
@@ -3943,6 +4133,7 @@ static void build_layer_cache(WeightFile *wf) {
             lc->v_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.weight", i);
             lc->o_w = get_tensor_ptr(wf, name);
+            lc->out_proj_bits = get_tensor_bits(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.scales", i);
             lc->o_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.self_attn.o_proj.biases", i);
@@ -3968,6 +4159,7 @@ static void build_layer_cache(WeightFile *wf) {
                 lc->fused_qkvz = 0;
                 snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.weight", i);
                 lc->qkv_w = get_tensor_ptr(wf, name);
+                lc->attn_proj_bits = get_tensor_bits(wf, name);
                 snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.scales", i);
                 lc->qkv_s = get_tensor_ptr(wf, name);
                 snprintf(name, sizeof(name), "model.layers.%d.linear_attn.in_proj_qkv.biases", i);
@@ -4030,6 +4222,7 @@ static void build_layer_cache(WeightFile *wf) {
             lc->gated_norm_w = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.weight", i);
             lc->out_proj_w = get_tensor_ptr(wf, name);
+            lc->out_proj_bits = get_tensor_bits(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.scales", i);
             lc->out_proj_s = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.linear_attn.out_proj.biases", i);
@@ -4060,6 +4253,7 @@ static void build_layer_cache(WeightFile *wf) {
         }
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
         lc->sg_w = get_tensor_ptr(wf, name);
+        lc->shared_gate_up_bits = get_tensor_bits(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
         lc->sg_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
@@ -4072,6 +4266,7 @@ static void build_layer_cache(WeightFile *wf) {
         lc->su_b = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
         lc->sd_w = get_tensor_ptr(wf, name);
+        lc->shared_down_bits = get_tensor_bits(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
         lc->sd_s = get_tensor_ptr(wf, name);
         snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
@@ -4096,6 +4291,15 @@ static void build_layer_cache(WeightFile *wf) {
     }
 
     layer_cache_built = 1;
+    // Diagnostic: print per-tensor bits for first layer
+    {
+        LayerWeightCache *lc0 = &layer_cache[0];
+        printf("[cache] Per-tensor bits (layer 0): attn_proj=%d, out_proj=%d, "
+               "gate=%d, seg=%d, shared_gu=%d, shared_d=%d\n",
+               lc0->attn_proj_bits, lc0->out_proj_bits,
+               lc0->gate_bits, lc0->seg_bits,
+               lc0->shared_gate_up_bits, lc0->shared_down_bits);
+    }
     printf("[cache] Pre-computed weight pointers for %d layers\n", NUM_LAYERS);
 }
 
@@ -4343,9 +4547,9 @@ static void fused_layer_forward(
 
         if (lc->q_w && lc->q_s && lc->q_b && lc->k_w && lc->k_s && lc->k_b &&
             lc->v_w && lc->v_s && lc->v_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2 };
+            attn_specs[0] = (BatchMatvecSpec){ lc->q_w, lc->q_s, lc->q_b, q_proj_out, (uint32_t)q_proj_dim, HIDDEN_DIM, GROUP_SIZE, 0, lc->attn_proj_bits };
+            attn_specs[1] = (BatchMatvecSpec){ lc->k_w, lc->k_s, lc->k_b, k_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 1, lc->attn_proj_bits };
+            attn_specs[2] = (BatchMatvecSpec){ lc->v_w, lc->v_s, lc->v_b, v_out,      (uint32_t)kv_dim,     HIDDEN_DIM, GROUP_SIZE, 2, lc->attn_proj_bits };
             num_attn_specs = 3;
         }
     } else {
@@ -4361,19 +4565,25 @@ static void fused_layer_forward(
             // Fused qkvz: single matmul outputs [qkv_dim + z_dim], split after
             int qkvz_dim = qkv_dim + z_dim;
             if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->b_w && lc->b_s && lc->b_b) {
-                attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkvz_dim,                             HIDDEN_DIM, GROUP_SIZE, 0, 0 };
+                attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkvz_dim,                             HIDDEN_DIM, GROUP_SIZE, 0, lc->attn_proj_bits };
                 int ba_dim = lc->fused_ba ? LINEAR_NUM_V_HEADS * 2 : LINEAR_NUM_V_HEADS;
-                attn_specs[1] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)ba_dim,                               HIDDEN_DIM, GROUP_SIZE, 2, 0 };
+                attn_specs[1] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)ba_dim,                               HIDDEN_DIM, GROUP_SIZE, 2, lc->attn_proj_bits };
                 num_attn_specs = 2;
             }
-        } else if (lc->qkv_w && lc->qkv_s && lc->qkv_b && lc->z_w && lc->z_s && lc->z_b &&
-            lc->b_w && lc->b_s && lc->b_b && lc->a_w && lc->a_s && lc->a_b) {
-            attn_specs[0] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out,   (uint32_t)qkv_dim,            HIDDEN_DIM, GROUP_SIZE, 0, 0 };
-            attn_specs[1] = (BatchMatvecSpec){ lc->z_w,   lc->z_s,   lc->z_b,   z_out,      (uint32_t)z_dim,              HIDDEN_DIM, GROUP_SIZE, 1, 0 };
-            attn_specs[2] = (BatchMatvecSpec){ lc->b_w,   lc->b_s,   lc->b_b,   beta_out,   (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, 0 };
-            attn_specs[3] = (BatchMatvecSpec){ lc->a_w,   lc->a_s,   lc->a_b,   alpha_out,  (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, 0 };
-            num_attn_specs = 4;
+        } else if (lc->qkv_w && lc->qkv_s && lc->qkv_b) {
+            // Batch the quantized projections (qkv, z)
+            attn_specs[num_attn_specs++] = (BatchMatvecSpec){ lc->qkv_w, lc->qkv_s, lc->qkv_b, qkv_out, (uint32_t)qkv_dim, HIDDEN_DIM, GROUP_SIZE, 0, lc->attn_proj_bits };
+            if (lc->z_w && lc->z_s && lc->z_b) {
+                attn_specs[num_attn_specs++] = (BatchMatvecSpec){ lc->z_w, lc->z_s, lc->z_b, z_out, (uint32_t)z_dim, HIDDEN_DIM, GROUP_SIZE, 1, lc->attn_proj_bits };
+            }
+            if (lc->b_w && lc->b_s && lc->b_b) {
+                attn_specs[num_attn_specs++] = (BatchMatvecSpec){ lc->b_w, lc->b_s, lc->b_b, beta_out, (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 2, lc->attn_proj_bits };
+            }
+            if (lc->a_w && lc->a_s && lc->a_b) {
+                attn_specs[num_attn_specs++] = (BatchMatvecSpec){ lc->a_w, lc->a_s, lc->a_b, alpha_out, (uint32_t)LINEAR_NUM_V_HEADS, HIDDEN_DIM, GROUP_SIZE, 3, lc->attn_proj_bits };
+            }
         }
+
     }
 
     // ---- Deferred completion + CMD1 (sequential) ----
@@ -4656,8 +4866,9 @@ static void fused_layer_forward(
         } else {
             for (int i = 0; i < num_attn_specs; i++) {
                 BatchMatvecSpec *s = &attn_specs[i];
-                cpu_dequant_matvec(s->W, s->scales, s->biases, normed, s->out_cpu,
-                                   s->out_dim, s->in_dim, s->group_size);
+                int eff_bits = s->bits > 0 ? s->bits : g_cfg->bits;
+                cpu_dequant_matvec_bits(s->W, s->scales, s->biases, normed, s->out_cpu,
+                                        s->out_dim, s->in_dim, s->group_size, eff_bits);
             }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
@@ -4671,6 +4882,36 @@ static void fused_layer_forward(
             }
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
+    }
+
+    // ---- BF16 (unquantized) projection fallback for mixed-precision models ----
+    // If b/a/z weights are BF16 (no scales), they weren't included in the batch.
+    // Compute them now using the normed hidden state.
+    {
+        int need_bf16_fallback = !is_full && (
+            (lc->z_w && !lc->z_s) ||
+            (lc->b_w && !lc->b_s) ||
+            (lc->a_w && !lc->a_s));
+        if (need_bf16_fallback) {
+            // Ensure normed input is on CPU. In the fast path (prev_gpu_combined),
+            // the normed data is only on GPU in buf_input. Read it back.
+            if (prev_gpu_combined && g_metal) {
+                memcpy(normed, [g_metal->buf_input contents], HIDDEN_DIM * sizeof(float));
+            }
+            int z_dim_local = LINEAR_TOTAL_VALUE;
+            if (lc->z_w && !lc->z_s) {
+                cpu_bf16_matvec((const uint16_t *)lc->z_w, normed,
+                                z_out, z_dim_local, HIDDEN_DIM);
+            }
+            if (lc->b_w && !lc->b_s) {
+                cpu_bf16_matvec((const uint16_t *)lc->b_w, normed,
+                                beta_out, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
+            }
+            if (lc->a_w && !lc->a_s) {
+                cpu_bf16_matvec((const uint16_t *)lc->a_w, normed,
+                                alpha_out, LINEAR_NUM_V_HEADS, HIDDEN_DIM);
+            }
+        }
     }
 
     // =====================================================================
@@ -5141,7 +5382,8 @@ static void fused_layer_forward(
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
                          && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
 
-    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w && oproj_s && oproj_b &&
+    if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
+        (oproj_s || lc->out_proj_bits == 16) &&  // Allow bf16 unquantized o_proj
         g_metal && g_metal->wf_buf && have_moe_weights &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
@@ -5252,8 +5494,8 @@ static void fused_layer_forward(
         // ---- o_proj matvec ----
         {
             NSUInteger w_off = (NSUInteger)((const char *)oproj_w - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger s_off = (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]);
-            NSUInteger b_off = (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]);
+            NSUInteger s_off = oproj_s ? (NSUInteger)((const char *)oproj_s - (const char *)[g_metal->wf_buf contents]) : 0;
+            NSUInteger b_off = oproj_b ? (NSUInteger)((const char *)oproj_b - (const char *)[g_metal->wf_buf contents]) : 0;
 
             // For GPU attention: o_proj reads from buf_attn_out
             // For CPU attention: o_proj reads from batch_out[6]
@@ -5263,17 +5505,35 @@ static void fused_layer_forward(
             uint32_t o_out_dim = HIDDEN_DIM;
             uint32_t o_in_dim = (uint32_t)oproj_in_dim;
             uint32_t o_gs = GROUP_SIZE;
-            [enc setComputePipelineState:(g_cfg->bits == 8) ? g_metal->matvec_8bit_fast : g_metal->matvec_fast];
-            [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
-            [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
-            [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
-            [enc setBuffer:oproj_input      offset:0    atIndex:3];
-            [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
-            [enc setBytes:&o_out_dim  length:4 atIndex:5];
-            [enc setBytes:&o_in_dim   length:4 atIndex:6];
-            [enc setBytes:&o_gs       length:4 atIndex:7];
-            [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            int oproj_bits = lc->out_proj_bits > 0 ? lc->out_proj_bits : g_cfg->bits;
+            id<MTLComputePipelineState> oproj_pipe = select_dequant_pipe(g_metal, oproj_bits, oproj_in_dim);
+            [enc setComputePipelineState:oproj_pipe];
+            if (oproj_bits == 16) {
+                // BF16 unquantized o_proj: different buffer layout
+                [enc setBuffer:g_metal->wf_buf     offset:w_off atIndex:0];
+                [enc setBuffer:oproj_input         offset:0     atIndex:1];
+                [enc setBuffer:g_metal->buf_output offset:0     atIndex:2];
+                [enc setBytes:&o_out_dim  length:4 atIndex:3];
+                [enc setBytes:&o_in_dim   length:4 atIndex:4];
+            } else {
+                [enc setBuffer:g_metal->wf_buf  offset:w_off atIndex:0];
+                [enc setBuffer:g_metal->wf_buf  offset:s_off atIndex:1];
+                [enc setBuffer:g_metal->wf_buf  offset:b_off atIndex:2];
+                [enc setBuffer:oproj_input      offset:0    atIndex:3];
+                [enc setBuffer:g_metal->buf_output offset:0 atIndex:4];
+                [enc setBytes:&o_out_dim  length:4 atIndex:5];
+                [enc setBytes:&o_in_dim   length:4 atIndex:6];
+                [enc setBytes:&o_gs       length:4 atIndex:7];
+            }
+            int o_use_small = (oproj_bits == 16) ? (oproj_in_dim <= 8192) : (oproj_in_dim <= 4096);
+            if (o_use_small) {
+                uint32_t num_tgs = (o_out_dim + 7) / 8;
+                [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            } else {
+                [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            }
             [enc endEncoding];
         }
 
@@ -5328,8 +5588,8 @@ static void fused_layer_forward(
         // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
         BatchMatvecSpec moe_specs[4] = {
             { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, lc->gate_bits },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, 0 },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, 0 },
+            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, lc->shared_gate_up_bits },
+            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, lc->shared_gate_up_bits },
             { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, lc->seg_bits },
         };
         // buf_input already contains h_post from Enc 4 output -- no memcpy needed
@@ -5354,10 +5614,16 @@ static void fused_layer_forward(
 
     } else {
         // ---- Non-fused fallback path ----
-        // O projection
-        if (attn_out_for_oproj && oproj_w && oproj_s && oproj_b) {
-            fast_dequant_matvec(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
-                                attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE);
+        // O projection (may be BF16 unquantized in mixed-precision models)
+        if (attn_out_for_oproj && oproj_w) {
+            int ob = lc->out_proj_bits;
+            if (oproj_s && oproj_b) {
+                fast_dequant_matvec_ex(oproj_w, oproj_s, oproj_b, attn_out_for_oproj,
+                                       attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE, ob);
+            } else {
+                fast_dequant_matvec_ex(oproj_w, NULL, NULL, attn_out_for_oproj,
+                                       attn_projected, HIDDEN_DIM, oproj_in_dim, GROUP_SIZE, 16);
+            }
         }
         // attn_out_for_oproj is static — no free needed
         attn_out_for_oproj = NULL;
@@ -5376,10 +5642,10 @@ static void fused_layer_forward(
         // Routing + shared expert batch
         if (have_moe_weights) {
             BatchMatvecSpec moe_specs[4] = {
-                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0 },
-                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1 },
-                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2 },
-                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3 },
+                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, lc->gate_bits },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, lc->shared_gate_up_bits },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, lc->shared_gate_up_bits },
+                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, lc->seg_bits },
             };
             fast_batch_matvec(h_post, HIDDEN_DIM, moe_specs, 4);
         }
@@ -5724,12 +5990,12 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // Shared down_proj dispatch
+        // Shared down_proj dispatch (may be 5-bit in mixed-precision models)
         if (sdw && sds && sdb) {
             gpu_encode_dequant_matvec_with_io_bufs(
                 g_metal, cmd_experts, sdw, sds, sdb,
                 g_metal->buf_shared_act, g_metal->buf_shared_out,
-                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE, lc->shared_down_bits);
         }
 
         // Step 4: GPU-side combine + residual + norm (if not last layer)
@@ -5890,8 +6156,11 @@ static void fused_layer_forward(
             cpu_dequant_matvec(uw, us_p, ub_p, h_post, up_proj_out,
                                MOE_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE);
             cpu_swiglu(gate_proj_out, up_proj_out, act_out, MOE_INTERMEDIATE);
-            cpu_dequant_matvec(dw, ds_p, db_p, act_out, expert_out_cpu,
-                               HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE);
+            {
+                int db = g_cfg->down_bits > 0 ? g_cfg->down_bits : g_cfg->bits;
+                cpu_dequant_matvec_bits(dw, ds_p, db_p, act_out, expert_out_cpu,
+                                       HIDDEN_DIM, MOE_INTERMEDIATE, GROUP_SIZE, db);
+            }
 
             free(gate_proj_out);
             free(up_proj_out);
@@ -5906,8 +6175,9 @@ static void fused_layer_forward(
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
         if (sdw && sds && sdb) {
-            cpu_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                               HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+            int db = lc->shared_down_bits > 0 ? lc->shared_down_bits : g_cfg->bits;
+            cpu_dequant_matvec_bits(sdw, sds, sdb, shared_act, shared_out,
+                                    HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE, db);
         }
         free(shared_act);
     } else {
@@ -5915,8 +6185,8 @@ static void fused_layer_forward(
         float *shared_act = calloc(SHARED_INTERMEDIATE, sizeof(float));
         cpu_swiglu(shared_gate, shared_up, shared_act, SHARED_INTERMEDIATE);
         if (sdw && sds && sdb) {
-            fast_dequant_matvec(sdw, sds, sdb, shared_act, shared_out,
-                                HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE);
+            fast_dequant_matvec_ex(sdw, sds, sdb, shared_act, shared_out,
+                                   HIDDEN_DIM, SHARED_INTERMEDIATE, GROUP_SIZE, lc->shared_down_bits);
         }
         free(shared_act);
     }
@@ -5941,6 +6211,7 @@ static void fused_layer_forward(
 
     // h_post, h_mid, gate_scores, moe_out, shared_out, shared_gate, shared_up
     // are all static scratch buffers — no free needed.
+
 }
 
 // ============================================================================

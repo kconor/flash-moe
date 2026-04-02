@@ -61,6 +61,7 @@ typedef struct {
     // Quantization
     int group_size;
     int bits;                   // default quantization (4, 8, etc.)
+    int down_bits;              // expert down_proj bits (0 = same as bits)
 
     // Special tokens (model-dependent)
     int eos_token_1;
@@ -91,10 +92,12 @@ typedef struct {
 // Expert binary layout computation
 // ============================================================================
 
-// Compute expert layout for a given bit width.
+// Compute expert layout for given bit widths.
 // Layout: gate_w, gate_s, gate_b, up_w, up_s, up_b, down_w, down_s, down_b
+// gate_up_bits: bit width for gate/up projections
+// down_bits: bit width for down projection (may differ in mixed-precision models)
 static inline void compute_expert_layout_bits(
-    int hidden_dim, int moe_intermediate, int group_size, int bits,
+    int hidden_dim, int moe_intermediate, int group_size, int gate_up_bits, int down_bits,
     size_t *out_expert_size,
     size_t *gw_off, size_t *gw_sz, size_t *gs_off, size_t *gs_sz, size_t *gb_off, size_t *gb_sz,
     size_t *uw_off, size_t *uw_sz, size_t *us_off, size_t *us_sz, size_t *ub_off, size_t *ub_sz,
@@ -103,15 +106,17 @@ static inline void compute_expert_layout_bits(
     int in_dim = hidden_dim;
     int mid = moe_intermediate;
     int gs = group_size;
-    int epk = 32 / bits;  // elements per packed uint32
 
-    // gate/up: [mid, in_dim] -> packed [mid, in_dim/epk] uint32
-    size_t w_size = (size_t)mid * (in_dim / epk) * sizeof(uint32_t);
-    // scales/biases: [mid, in_dim/gs] bf16
+    // gate/up: [mid, in_dim] -> packed [mid, in_dim * gate_up_bits / 32] uint32
+    // Uses bits*dim/32 to handle non-power-of-2 bit widths (5, 6, etc.)
+    size_t gate_up_packed_cols = (size_t)in_dim * gate_up_bits / 32;
+    size_t w_size = (size_t)mid * gate_up_packed_cols * sizeof(uint32_t);
+    // scales/biases: [mid, in_dim/gs] bf16 (independent of bit width)
     size_t sb_size = (size_t)mid * (in_dim / gs) * sizeof(uint16_t);
 
-    // down: [in_dim, mid] -> packed [in_dim, mid/epk] uint32
-    size_t dw_size_ = (size_t)in_dim * (mid / epk) * sizeof(uint32_t);
+    // down: [in_dim, mid] -> packed [in_dim, mid * down_bits / 32] uint32
+    size_t down_packed_cols = (size_t)mid * down_bits / 32;
+    size_t dw_size_ = (size_t)in_dim * down_packed_cols * sizeof(uint32_t);
     // scales/biases: [in_dim, mid/gs] bf16
     size_t dsb_size = (size_t)in_dim * (mid / gs) * sizeof(uint16_t);
 
@@ -142,9 +147,12 @@ static inline void model_config_compute(ModelConfig *cfg) {
     // Derived RoPE
     cfg->rotary_dim = (int)(cfg->head_dim * cfg->partial_rotary);
 
-    // Primary expert layout (cfg->bits)
+    // Resolve down_bits: 0 means same as bits
+    int eff_down_bits = cfg->down_bits > 0 ? cfg->down_bits : cfg->bits;
+
+    // Primary expert layout (cfg->bits for gate/up, eff_down_bits for down)
     compute_expert_layout_bits(
-        cfg->hidden_dim, cfg->moe_intermediate, cfg->group_size, cfg->bits,
+        cfg->hidden_dim, cfg->moe_intermediate, cfg->group_size, cfg->bits, eff_down_bits,
         &cfg->expert_size,
         &cfg->gate_w_off, &cfg->gate_w_size, &cfg->gate_s_off, &cfg->gate_s_size,
         &cfg->gate_b_off, &cfg->gate_b_size,
@@ -157,7 +165,7 @@ static inline void model_config_compute(ModelConfig *cfg) {
     // 2-bit expert layout (for --2bit option)
     size_t dummy_sz;  // we only store offsets for 2-bit, sizes same structure
     compute_expert_layout_bits(
-        cfg->hidden_dim, cfg->moe_intermediate, cfg->group_size, 2,
+        cfg->hidden_dim, cfg->moe_intermediate, cfg->group_size, 2, 2,
         &cfg->expert_size_2bit,
         &cfg->gate_w_off_2, &dummy_sz, &cfg->gate_s_off_2, &dummy_sz,
         &cfg->gate_b_off_2, &dummy_sz,
@@ -168,11 +176,12 @@ static inline void model_config_compute(ModelConfig *cfg) {
     );
 
     printf("[config] %s: %d layers (%d linear + %d full-attn), "
-           "hidden=%d, experts=%d, intermediate=%d, bits=%d\n",
+           "hidden=%d, experts=%d, intermediate=%d, bits=%d%s\n",
            cfg->num_layers == 60 ? "Qwen3.5-397B" :
            cfg->num_layers == 40 ? "Qwen3.5-35B" : "Qwen3.5",
            cfg->num_layers, cfg->num_linear_layers, cfg->num_full_attn_layers,
-           cfg->hidden_dim, cfg->num_experts, cfg->moe_intermediate, cfg->bits);
+           cfg->hidden_dim, cfg->num_experts, cfg->moe_intermediate, cfg->bits,
+           eff_down_bits != cfg->bits ? " (mixed-precision)" : "");
     printf("[config] Expert size: %zu bytes (%zu 2-bit)\n",
            cfg->expert_size, cfg->expert_size_2bit);
 }

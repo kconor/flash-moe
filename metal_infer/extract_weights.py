@@ -60,26 +60,45 @@ def main():
     config_path = model_path / 'config.json'
     model_config = {}
     quant_config = {}
+    per_tensor_quant = {}  # tensor_name -> {"bits": N, ...}
     if config_path.exists():
         with open(config_path) as f:
             raw_config = json.load(f)
-        quant_config = raw_config.get('quantization_config', {})
+        # Prefer "quantization" key (MLX-node format), fall back to "quantization_config"
+        quant_raw = raw_config.get('quantization', raw_config.get('quantization_config', {}))
+        # Separate global defaults from per-tensor overrides
+        for key, val in quant_raw.items():
+            if isinstance(val, dict):
+                per_tensor_quant[key] = val
+            elif key in ('bits', 'group_size', 'mode'):
+                quant_config[key] = val
         # Handle multimodal models where text config is nested
         model_config = raw_config.get('text_config', raw_config)
         print(f"Loaded model config from {config_path}")
+        if per_tensor_quant:
+            unique_bits = sorted(set(v.get('bits', quant_config.get('bits', 4))
+                                     for v in per_tensor_quant.values()))
+            print(f"Mixed-precision quantization: {len(per_tensor_quant)} tensor overrides, "
+                  f"bit widths: {unique_bits}")
     else:
         print(f"WARNING: {config_path} not found, using defaults (Qwen3.5-397B)")
 
-    # Load the weight index
+    # Load the weight index — support both sharded (index.json) and single-file models
     index_path = model_path / 'model.safetensors.index.json'
-    if not index_path.exists():
-        print(f"ERROR: {index_path} not found", file=sys.stderr)
+    single_path = model_path / 'model.safetensors'
+    if index_path.exists():
+        with open(index_path) as f:
+            idx = json.load(f)
+        weight_map = idx['weight_map']
+    elif single_path.exists():
+        # Single safetensors file — build weight_map from header
+        header, _ = parse_safetensors_header(str(single_path))
+        header.pop('__metadata__', None)
+        weight_map = {name: 'model.safetensors' for name in header.keys()}
+        print(f"Single safetensors file: {len(weight_map)} tensors")
+    else:
+        print(f"ERROR: no model.safetensors or index.json in {model_path}", file=sys.stderr)
         sys.exit(1)
-
-    with open(index_path) as f:
-        idx = json.load(f)
-
-    weight_map = idx['weight_map']
 
     # Filter: keep only language_model weights, skip vision_tower
     # Also skip expert weights (switch_mlp.{gate_proj,up_proj,down_proj}.{weight,scales,biases})
@@ -163,6 +182,17 @@ def main():
         }
     }
 
+    # Detect mixed-precision expert quantization (e.g. Unsloth Dynamic)
+    # Look for switch_mlp.down_proj override with different bit width
+    default_bits = quant_config.get("bits", 4)
+    for ptq_key, ptq_val in per_tensor_quant.items():
+        if 'switch_mlp.down_proj' in ptq_key:
+            down_bits = ptq_val.get('bits', default_bits)
+            if down_bits != default_bits:
+                manifest["config"]["expert_down_bits"] = down_bits
+                print(f"Mixed-precision experts: gate/up={default_bits}bit, down={down_bits}bit")
+            break
+
     # Layer type map — compute from config
     num_layers = manifest["config"]["num_hidden_layers"]
     full_attn_interval = manifest["config"]["full_attention_interval"]
@@ -209,12 +239,27 @@ def main():
 
             out_f.write(data)
 
-            manifest["tensors"][san_name] = {
+            # Determine per-tensor quantization bits
+            tensor_bits = quant_config.get('bits', 4)  # global default
+            # Check per-tensor overrides — try both original and sanitized names
+            # The per-tensor keys use dotted paths like "language_model.model.layers.0.linear_attn.in_proj_qkv"
+            # We need to match against the base tensor name (without .weight/.scales/.biases suffix)
+            for ptq_key, ptq_val in per_tensor_quant.items():
+                # Match if the original tensor name starts with the override key
+                if orig_name.startswith(ptq_key + '.') or orig_name == ptq_key:
+                    tensor_bits = ptq_val.get('bits', tensor_bits)
+                    break
+
+            entry = {
                 "offset": offset,
                 "size": byte_len,
                 "shape": shape,
                 "dtype": dtype,
             }
+            # Only include per-tensor bits if it differs from global default
+            if tensor_bits != quant_config.get('bits', 4):
+                entry["bits"] = tensor_bits
+            manifest["tensors"][san_name] = entry
 
             offset += byte_len
             total_bytes += byte_len

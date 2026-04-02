@@ -41,15 +41,21 @@ def main():
     model_path = Path(args.model)
     output_path = args.output or str(model_path / 'expert_index.json')
 
-    # Load weight index
+    # Load weight index — support both sharded and single-file models
     index_path = model_path / 'model.safetensors.index.json'
-    if not index_path.exists():
-        print(f"ERROR: {index_path} not found", file=sys.stderr)
+    single_path = model_path / 'model.safetensors'
+    if index_path.exists():
+        with open(index_path) as f:
+            idx = json.load(f)
+        weight_map = idx['weight_map']
+    elif single_path.exists():
+        header, _ = parse_safetensors_header(str(single_path))
+        header.pop('__metadata__', None)
+        weight_map = {name: 'model.safetensors' for name in header.keys()}
+        print(f"Single safetensors file: {len(weight_map)} tensors")
+    else:
+        print(f"ERROR: no model.safetensors or index.json in {model_path}", file=sys.stderr)
         sys.exit(1)
-
-    with open(index_path) as f:
-        idx = json.load(f)
-    weight_map = idx['weight_map']
 
     # Find expert tensors: pattern is *.layers.{L}.mlp.switch_mlp.{component}
     # component is one of: gate_proj.weight, gate_proj.scales, gate_proj.biases,
