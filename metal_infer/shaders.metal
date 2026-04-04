@@ -624,12 +624,13 @@ kernel void dequant_matvec_8bit_fast(
 
 
 // ============================================================================
-// Kernel 1h: 6-bit affine dequant matvec (shared memory, for in_dim <= 4096)
+// Kernel 1h: 6-bit affine dequant matvec — FMA-optimized, chunk-based
 // ============================================================================
 // MLX affine 6-bit, group_size=64: 64 values × 6 bits = 384 bits = 12 uint32s per group.
-// Values are packed sequentially in bit order within each group. Some values straddle
-// uint32 boundaries (values 5 and 10 within each 16-value chunk).
-// packed_cols = in_dim * 6 / 32 per row.
+// Processes 16 values (3 uint32 words = 96 bits) per iteration with fully unrolled
+// FMA extraction. Pre-computes scale*x and bias*x for all 16 positions, then uses
+// hardware FMA for dequant+multiply in one instruction per value.
+// Straddle values (5 and 10) use hardcoded cross-word extraction — no branches.
 
 kernel void dequant_matvec_6bit(
     device const uint32_t* W_packed   [[buffer(0)]],
@@ -647,8 +648,11 @@ kernel void dequant_matvec_6bit(
 ) {
     uint row = tgid * ROWS_PER_TG + simd_group;
     uint num_groups = in_dim / group_size;
-    uint packed_per_group = group_size * 6 / 32;
+    uint packed_per_group = group_size * 6 / 32;  // 12 for gs=64
     uint packed_cols = num_groups * packed_per_group;
+
+    // 16 values per chunk, 4 chunks per group (64/16=4)
+    uint num_chunks = in_dim / 16;
 
     threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
@@ -663,25 +667,58 @@ kernel void dequant_matvec_6bit(
 
     float acc = 0.0f;
 
-    // Iterate per-value for maximum SIMD utilization
-    for (uint val_idx = simd_lane; val_idx < in_dim; val_idx += 32) {
-        uint g = val_idx / group_size;
-        uint within = val_idx - g * group_size;
-
+    // Each lane processes every 32nd chunk of 16 values (3 uint32 words)
+    for (uint chunk = simd_lane; chunk < num_chunks; chunk += 32) {
+        uint val_base = chunk * 16;
+        uint g = val_base / group_size;
         float scale = bf16_to_f32(s_row[g]);
         float bias  = bf16_to_f32(b_row[g]);
 
-        uint bit_pos = within * 6;
-        uint word = g * packed_per_group + (bit_pos >> 5);
-        uint bit  = bit_pos & 31;
+        // Word offset: chunk_within_group * 3 words per chunk
+        uint chunk_in_group = (val_base - g * group_size) / 16;
+        device const uint32_t* gw = w_row + g * packed_per_group + chunk_in_group * 3;
+        uint32_t w0 = gw[0], w1 = gw[1], w2 = gw[2];
 
-        uint val = (w_row[word] >> bit);
-        if (bit + 6 > 32) {
-            val |= (w_row[word + 1] << (32 - bit));
-        }
-        val &= 0x3F;
+        // Pre-compute scale*x and bias*x for all 16 positions
+        float sx00 = scale * x_shared[val_base +  0]; float bx00 = bias * x_shared[val_base +  0];
+        float sx01 = scale * x_shared[val_base +  1]; float bx01 = bias * x_shared[val_base +  1];
+        float sx02 = scale * x_shared[val_base +  2]; float bx02 = bias * x_shared[val_base +  2];
+        float sx03 = scale * x_shared[val_base +  3]; float bx03 = bias * x_shared[val_base +  3];
+        float sx04 = scale * x_shared[val_base +  4]; float bx04 = bias * x_shared[val_base +  4];
+        float sx05 = scale * x_shared[val_base +  5]; float bx05 = bias * x_shared[val_base +  5];
+        float sx06 = scale * x_shared[val_base +  6]; float bx06 = bias * x_shared[val_base +  6];
+        float sx07 = scale * x_shared[val_base +  7]; float bx07 = bias * x_shared[val_base +  7];
+        float sx08 = scale * x_shared[val_base +  8]; float bx08 = bias * x_shared[val_base +  8];
+        float sx09 = scale * x_shared[val_base +  9]; float bx09 = bias * x_shared[val_base +  9];
+        float sx10 = scale * x_shared[val_base + 10]; float bx10 = bias * x_shared[val_base + 10];
+        float sx11 = scale * x_shared[val_base + 11]; float bx11 = bias * x_shared[val_base + 11];
+        float sx12 = scale * x_shared[val_base + 12]; float bx12 = bias * x_shared[val_base + 12];
+        float sx13 = scale * x_shared[val_base + 13]; float bx13 = bias * x_shared[val_base + 13];
+        float sx14 = scale * x_shared[val_base + 14]; float bx14 = bias * x_shared[val_base + 14];
+        float sx15 = scale * x_shared[val_base + 15]; float bx15 = bias * x_shared[val_base + 15];
 
-        acc += (float(val) * scale + bias) * x_shared[val_idx];
+        // 16 FMA extractions — hardcoded shifts, no branches
+        // Values 0-4: word 0 (clean)
+        acc += fma(float((w0 >>  0) & 0x3F), sx00, bx00);
+        acc += fma(float((w0 >>  6) & 0x3F), sx01, bx01);
+        acc += fma(float((w0 >> 12) & 0x3F), sx02, bx02);
+        acc += fma(float((w0 >> 18) & 0x3F), sx03, bx03);
+        acc += fma(float((w0 >> 24) & 0x3F), sx04, bx04);
+        // Value 5: straddle word 0→1
+        acc += fma(float(((w0 >> 30) | (w1 << 2)) & 0x3F), sx05, bx05);
+        // Values 6-9: word 1 (clean)
+        acc += fma(float((w1 >>  4) & 0x3F), sx06, bx06);
+        acc += fma(float((w1 >> 10) & 0x3F), sx07, bx07);
+        acc += fma(float((w1 >> 16) & 0x3F), sx08, bx08);
+        acc += fma(float((w1 >> 22) & 0x3F), sx09, bx09);
+        // Value 10: straddle word 1→2
+        acc += fma(float(((w1 >> 28) | (w2 << 4)) & 0x3F), sx10, bx10);
+        // Values 11-15: word 2 (clean)
+        acc += fma(float((w2 >>  2) & 0x3F), sx11, bx11);
+        acc += fma(float((w2 >>  8) & 0x3F), sx12, bx12);
+        acc += fma(float((w2 >> 14) & 0x3F), sx13, bx13);
+        acc += fma(float((w2 >> 20) & 0x3F), sx14, bx14);
+        acc += fma(float((w2 >> 26) & 0x3F), sx15, bx15);
     }
 
     float sum = simd_sum(acc);
@@ -759,12 +796,12 @@ kernel void dequant_matvec_6bit_fast(
 
 
 // ============================================================================
-// Kernel 1i: 5-bit affine dequant matvec (shared memory, for in_dim <= 4096)
+// Kernel 1i: 5-bit affine dequant matvec — FMA-optimized, chunk-based
 // ============================================================================
 // MLX affine 5-bit, group_size=64: 64 values × 5 bits = 320 bits = 10 uint32s per group.
-// Values are packed sequentially in bit order. Straddles occur at values 6, 12, 19, 25
-// within each 32-value chunk (since LCM(5,32) = 160 bits = 32 values, 5 words).
-// packed_cols = in_dim * 5 / 32 per row.
+// Processes 32 values (5 uint32 words = 160 bits) per iteration with fully unrolled
+// FMA extraction. Pre-computes scale*x and bias*x for all 32 positions.
+// Straddle values (6, 12, 19, 25) use hardcoded cross-word extraction — no branches.
 
 kernel void dequant_matvec_5bit(
     device const uint32_t* W_packed   [[buffer(0)]],
@@ -782,8 +819,11 @@ kernel void dequant_matvec_5bit(
 ) {
     uint row = tgid * ROWS_PER_TG + simd_group;
     uint num_groups = in_dim / group_size;
-    uint packed_per_group = group_size * 5 / 32;
+    uint packed_per_group = group_size * 5 / 32;  // 10 for gs=64
     uint packed_cols = num_groups * packed_per_group;
+
+    // 32 values per chunk, 2 chunks per group (64/32=2)
+    uint num_chunks = in_dim / 32;
 
     threadgroup float x_shared[4096];
     for (uint i = lid; i < in_dim; i += 256) {
@@ -798,24 +838,94 @@ kernel void dequant_matvec_5bit(
 
     float acc = 0.0f;
 
-    for (uint val_idx = simd_lane; val_idx < in_dim; val_idx += 32) {
-        uint g = val_idx / group_size;
-        uint within = val_idx - g * group_size;
-
+    // Each lane processes every 32nd chunk of 32 values (5 uint32 words)
+    for (uint chunk = simd_lane; chunk < num_chunks; chunk += 32) {
+        uint val_base = chunk * 32;
+        uint g = val_base / group_size;
         float scale = bf16_to_f32(s_row[g]);
         float bias  = bf16_to_f32(b_row[g]);
 
-        uint bit_pos = within * 5;
-        uint word = g * packed_per_group + (bit_pos >> 5);
-        uint bit  = bit_pos & 31;
+        // Word offset: chunk_within_group * 5 words per chunk
+        uint chunk_in_group = (val_base - g * group_size) / 32;
+        device const uint32_t* gw = w_row + g * packed_per_group + chunk_in_group * 5;
+        uint32_t w0 = gw[0], w1 = gw[1], w2 = gw[2], w3 = gw[3], w4 = gw[4];
 
-        uint val = (w_row[word] >> bit);
-        if (bit + 5 > 32) {
-            val |= (w_row[word + 1] << (32 - bit));
-        }
-        val &= 0x1F;
+        // Pre-compute scale*x and bias*x for all 32 positions
+        float sx00 = scale * x_shared[val_base +  0]; float bx00 = bias * x_shared[val_base +  0];
+        float sx01 = scale * x_shared[val_base +  1]; float bx01 = bias * x_shared[val_base +  1];
+        float sx02 = scale * x_shared[val_base +  2]; float bx02 = bias * x_shared[val_base +  2];
+        float sx03 = scale * x_shared[val_base +  3]; float bx03 = bias * x_shared[val_base +  3];
+        float sx04 = scale * x_shared[val_base +  4]; float bx04 = bias * x_shared[val_base +  4];
+        float sx05 = scale * x_shared[val_base +  5]; float bx05 = bias * x_shared[val_base +  5];
+        float sx06 = scale * x_shared[val_base +  6]; float bx06 = bias * x_shared[val_base +  6];
+        float sx07 = scale * x_shared[val_base +  7]; float bx07 = bias * x_shared[val_base +  7];
+        float sx08 = scale * x_shared[val_base +  8]; float bx08 = bias * x_shared[val_base +  8];
+        float sx09 = scale * x_shared[val_base +  9]; float bx09 = bias * x_shared[val_base +  9];
+        float sx10 = scale * x_shared[val_base + 10]; float bx10 = bias * x_shared[val_base + 10];
+        float sx11 = scale * x_shared[val_base + 11]; float bx11 = bias * x_shared[val_base + 11];
+        float sx12 = scale * x_shared[val_base + 12]; float bx12 = bias * x_shared[val_base + 12];
+        float sx13 = scale * x_shared[val_base + 13]; float bx13 = bias * x_shared[val_base + 13];
+        float sx14 = scale * x_shared[val_base + 14]; float bx14 = bias * x_shared[val_base + 14];
+        float sx15 = scale * x_shared[val_base + 15]; float bx15 = bias * x_shared[val_base + 15];
+        float sx16 = scale * x_shared[val_base + 16]; float bx16 = bias * x_shared[val_base + 16];
+        float sx17 = scale * x_shared[val_base + 17]; float bx17 = bias * x_shared[val_base + 17];
+        float sx18 = scale * x_shared[val_base + 18]; float bx18 = bias * x_shared[val_base + 18];
+        float sx19 = scale * x_shared[val_base + 19]; float bx19 = bias * x_shared[val_base + 19];
+        float sx20 = scale * x_shared[val_base + 20]; float bx20 = bias * x_shared[val_base + 20];
+        float sx21 = scale * x_shared[val_base + 21]; float bx21 = bias * x_shared[val_base + 21];
+        float sx22 = scale * x_shared[val_base + 22]; float bx22 = bias * x_shared[val_base + 22];
+        float sx23 = scale * x_shared[val_base + 23]; float bx23 = bias * x_shared[val_base + 23];
+        float sx24 = scale * x_shared[val_base + 24]; float bx24 = bias * x_shared[val_base + 24];
+        float sx25 = scale * x_shared[val_base + 25]; float bx25 = bias * x_shared[val_base + 25];
+        float sx26 = scale * x_shared[val_base + 26]; float bx26 = bias * x_shared[val_base + 26];
+        float sx27 = scale * x_shared[val_base + 27]; float bx27 = bias * x_shared[val_base + 27];
+        float sx28 = scale * x_shared[val_base + 28]; float bx28 = bias * x_shared[val_base + 28];
+        float sx29 = scale * x_shared[val_base + 29]; float bx29 = bias * x_shared[val_base + 29];
+        float sx30 = scale * x_shared[val_base + 30]; float bx30 = bias * x_shared[val_base + 30];
+        float sx31 = scale * x_shared[val_base + 31]; float bx31 = bias * x_shared[val_base + 31];
 
-        acc += (float(val) * scale + bias) * x_shared[val_idx];
+        // 32 FMA extractions — hardcoded shifts, no branches
+        // Values 0-5: word 0 (clean)
+        acc += fma(float((w0 >>  0) & 0x1F), sx00, bx00);
+        acc += fma(float((w0 >>  5) & 0x1F), sx01, bx01);
+        acc += fma(float((w0 >> 10) & 0x1F), sx02, bx02);
+        acc += fma(float((w0 >> 15) & 0x1F), sx03, bx03);
+        acc += fma(float((w0 >> 20) & 0x1F), sx04, bx04);
+        acc += fma(float((w0 >> 25) & 0x1F), sx05, bx05);
+        // Value 6: straddle word 0→1
+        acc += fma(float(((w0 >> 30) | (w1 << 2)) & 0x1F), sx06, bx06);
+        // Values 7-11: word 1 (clean)
+        acc += fma(float((w1 >>  3) & 0x1F), sx07, bx07);
+        acc += fma(float((w1 >>  8) & 0x1F), sx08, bx08);
+        acc += fma(float((w1 >> 13) & 0x1F), sx09, bx09);
+        acc += fma(float((w1 >> 18) & 0x1F), sx10, bx10);
+        acc += fma(float((w1 >> 23) & 0x1F), sx11, bx11);
+        // Value 12: straddle word 1→2
+        acc += fma(float(((w1 >> 28) | (w2 << 4)) & 0x1F), sx12, bx12);
+        // Values 13-18: word 2 (clean)
+        acc += fma(float((w2 >>  1) & 0x1F), sx13, bx13);
+        acc += fma(float((w2 >>  6) & 0x1F), sx14, bx14);
+        acc += fma(float((w2 >> 11) & 0x1F), sx15, bx15);
+        acc += fma(float((w2 >> 16) & 0x1F), sx16, bx16);
+        acc += fma(float((w2 >> 21) & 0x1F), sx17, bx17);
+        acc += fma(float((w2 >> 26) & 0x1F), sx18, bx18);
+        // Value 19: straddle word 2→3
+        acc += fma(float(((w2 >> 31) | (w3 << 1)) & 0x1F), sx19, bx19);
+        // Values 20-24: word 3 (clean)
+        acc += fma(float((w3 >>  4) & 0x1F), sx20, bx20);
+        acc += fma(float((w3 >>  9) & 0x1F), sx21, bx21);
+        acc += fma(float((w3 >> 14) & 0x1F), sx22, bx22);
+        acc += fma(float((w3 >> 19) & 0x1F), sx23, bx23);
+        acc += fma(float((w3 >> 24) & 0x1F), sx24, bx24);
+        // Value 25: straddle word 3→4
+        acc += fma(float(((w3 >> 29) | (w4 << 3)) & 0x1F), sx25, bx25);
+        // Values 26-31: word 4 (clean)
+        acc += fma(float((w4 >>  2) & 0x1F), sx26, bx26);
+        acc += fma(float((w4 >>  7) & 0x1F), sx27, bx27);
+        acc += fma(float((w4 >> 12) & 0x1F), sx28, bx28);
+        acc += fma(float((w4 >> 17) & 0x1F), sx29, bx29);
+        acc += fma(float((w4 >> 22) & 0x1F), sx30, bx30);
+        acc += fma(float((w4 >> 27) & 0x1F), sx31, bx31);
     }
 
     float sum = simd_sum(acc);
