@@ -481,6 +481,7 @@ static ModelConfig *load_model_config(const char *json_path) {
         CFG_INT(num_experts_per_tok, "num_experts_per_tok",            10);
         CFG_INT(moe_intermediate,    "moe_intermediate_size",          1024);
         CFG_INT(shared_intermediate, "shared_expert_intermediate_size",1024);
+        CFG_INT(intermediate_size,   "intermediate_size",                0);
         CFG_INT(full_attn_interval,  "full_attention_interval",        4);
         CFG_INT(linear_num_v_heads,  "linear_num_value_heads",         64);
         CFG_INT(linear_num_k_heads,  "linear_num_key_heads",           16);
@@ -522,11 +523,15 @@ static void init_model_arrays(void) {
     int ne8 = (ne + 7) / 8;
 
     g_lz4_index = calloc(nl, sizeof(LZ4IndexEntry *));
-    g_expert_freq = calloc((size_t)nl * ne, sizeof(int));
-    g_expert_seen = calloc((size_t)nl * ne8, sizeof(uint8_t));
-    g_cache_seen = calloc((size_t)nl * ne, sizeof(uint8_t));
-    g_cache_last_touch_token = calloc((size_t)nl * ne, sizeof(uint64_t));
-    g_cache_last_evict_token = calloc((size_t)nl * ne, sizeof(uint64_t));
+    // For dense models ne == 0 — these arrays are unused, but calloc(0, x) is
+    // implementation-defined. Allocate a safe minimum so pointers are non-NULL.
+    size_t ne_safe = ne > 0 ? (size_t)nl * ne : 1;
+    size_t ne8_safe = ne > 0 ? (size_t)nl * ne8 : 1;
+    g_expert_freq = calloc(ne_safe, sizeof(int));
+    g_expert_seen = calloc(ne8_safe, sizeof(uint8_t));
+    g_cache_seen = calloc(ne_safe, sizeof(uint8_t));
+    g_cache_last_touch_token = calloc(ne_safe, sizeof(uint64_t));
+    g_cache_last_evict_token = calloc(ne_safe, sizeof(uint64_t));
 }
 
 // Forward declaration — called after init_model_arrays to allocate deferred state
@@ -1300,60 +1305,68 @@ static MetalCtx *metal_setup(void) {
         }
     }
 
-    // Expert computation buffers (reused across all experts and layers)
-    ctx->buf_expert_data  = [ctx->device newBufferWithLength:EXPERT_SIZE
-                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_expert_gate  = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_expert_up    = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_expert_act   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
-    ctx->buf_expert_out   = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                     options:MTLResourceStorageModeShared];
+    // Expert computation buffers (MoE only — skip allocation for dense models).
+    if (!IS_DENSE) {
+        ctx->buf_expert_data  = [ctx->device newBufferWithLength:EXPERT_SIZE
+                                                         options:MTLResourceStorageModeShared];
+        ctx->buf_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        ctx->buf_expert_gate  = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        ctx->buf_expert_up    = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        ctx->buf_expert_act   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
+        ctx->buf_expert_out   = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                         options:MTLResourceStorageModeShared];
 
-    // Multi-expert buffers: K independent slots (double-buffered data)
-    // Expert data buffers use 2MB-aligned backing memory for DMA efficiency.
-    // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
-    ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                           options:MTLResourceStorageModeShared];
-    size_t expert_alloc_size = (EXPERT_SIZE + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
-    for (int k = 0; k < MAX_K; k++) {
-        // 2MB-aligned allocation for optimal DMA throughput
-        void *aligned_data = NULL, *aligned_data_b = NULL;
-        posix_memalign(&aligned_data,   2*1024*1024, expert_alloc_size);
-        posix_memalign(&aligned_data_b, 2*1024*1024, expert_alloc_size);
-        memset(aligned_data, 0, expert_alloc_size);
-        memset(aligned_data_b, 0, expert_alloc_size);
-        ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithBytesNoCopy:aligned_data
-                                                                       length:expert_alloc_size
-                                                                      options:MTLResourceStorageModeShared
-                                                                  deallocator:nil];
-        ctx->buf_multi_expert_data_B[k] = [ctx->device newBufferWithBytesNoCopy:aligned_data_b
-                                                                         length:expert_alloc_size
-                                                                        options:MTLResourceStorageModeShared
-                                                                    deallocator:nil];
-        ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                                 options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                                 options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_act[k]  = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
-                                                                 options:MTLResourceStorageModeShared];
-        ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                                 options:MTLResourceStorageModeShared];
+        // Multi-expert buffers: K independent slots (double-buffered data)
+        // Expert data buffers use 2MB-aligned backing memory for DMA efficiency.
+        // The pread DMA controller transfers 3.6x faster with 2MB alignment vs 16KB.
+        ctx->buf_multi_expert_input = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                               options:MTLResourceStorageModeShared];
+        size_t expert_alloc_size = (EXPERT_SIZE + 2*1024*1024 - 1) & ~(2*1024*1024 - 1);  // round up to 2MB
+        for (int k = 0; k < MAX_K; k++) {
+            // 2MB-aligned allocation for optimal DMA throughput
+            void *aligned_data = NULL, *aligned_data_b = NULL;
+            posix_memalign(&aligned_data,   2*1024*1024, expert_alloc_size);
+            posix_memalign(&aligned_data_b, 2*1024*1024, expert_alloc_size);
+            memset(aligned_data, 0, expert_alloc_size);
+            memset(aligned_data_b, 0, expert_alloc_size);
+            ctx->buf_multi_expert_data[k] = [ctx->device newBufferWithBytesNoCopy:aligned_data
+                                                                           length:expert_alloc_size
+                                                                          options:MTLResourceStorageModeShared
+                                                                      deallocator:nil];
+            ctx->buf_multi_expert_data_B[k] = [ctx->device newBufferWithBytesNoCopy:aligned_data_b
+                                                                             length:expert_alloc_size
+                                                                            options:MTLResourceStorageModeShared
+                                                                        deallocator:nil];
+            ctx->buf_multi_expert_gate[k] = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+            ctx->buf_multi_expert_up[k]   = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+            ctx->buf_multi_expert_act[k]  = [ctx->device newBufferWithLength:MOE_INTERMEDIATE * sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+            ctx->buf_multi_expert_out[k]  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                                     options:MTLResourceStorageModeShared];
+        }
     }
 
-    // Shared expert buffers (for fused CMD2)
-    ctx->buf_shared_gate = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_up   = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_act  = [ctx->device newBufferWithLength:SHARED_INTERMEDIATE * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
-    ctx->buf_shared_out  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
-                                                    options:MTLResourceStorageModeShared];
+    // Shared expert buffers (for fused CMD2). Also reused as the dense MLP
+    // intermediate buffers when IS_DENSE — must fit max(shared, dense) intermediate.
+    {
+        size_t mlp_intermediate = (size_t)SHARED_INTERMEDIATE;
+        if ((size_t)INTERMEDIATE_SIZE > mlp_intermediate) mlp_intermediate = (size_t)INTERMEDIATE_SIZE;
+        if (mlp_intermediate == 0) mlp_intermediate = 1;  // avoid zero-length buffers
+        ctx->buf_shared_gate = [ctx->device newBufferWithLength:mlp_intermediate * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_shared_up   = [ctx->device newBufferWithLength:mlp_intermediate * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_shared_act  = [ctx->device newBufferWithLength:mlp_intermediate * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+        ctx->buf_shared_out  = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
+                                                        options:MTLResourceStorageModeShared];
+    }
 
     // Fused o_proj+norm+routing buffers
     ctx->buf_residual = [ctx->device newBufferWithLength:HIDDEN_DIM * sizeof(float)
@@ -1476,9 +1489,16 @@ static void metal_set_weights(MetalCtx *ctx, void *data, size_t size) {
     size_t page_size = 16384;
     size_t aligned_size = (size + page_size - 1) & ~(page_size - 1);
 
+    // Untracked hazard mode tells Metal not to add this buffer to the
+    // automatic working set / hazard tracking. For very large weight buffers
+    // (>8 GB) this avoids "Insufficient Memory" command-buffer errors on
+    // Apple Silicon GPUs that would otherwise try to keep the entire buffer
+    // resident across every command. We only ever read from wf_buf, so there
+    // are no real hazards to track.
     ctx->wf_buf = [ctx->device newBufferWithBytesNoCopy:data
                                                  length:aligned_size
-                                                options:MTLResourceStorageModeShared
+                                                options:MTLResourceStorageModeShared |
+                                                        MTLResourceHazardTrackingModeUntracked
                                             deallocator:nil];
     if (!ctx->wf_buf) {
         fprintf(stderr, "WARNING: Cannot wrap weight file as Metal buffer (size=%.2f GB)\n",
@@ -4229,63 +4249,95 @@ static void build_layer_cache(WeightFile *wf) {
             lc->out_proj_b = get_tensor_ptr(wf, name);
         }
 
-        // MoE weights (same for all layers)
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
-        lc->gate_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
-        lc->gate_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
-        lc->gate_b = get_tensor_ptr(wf, name);
-        // Detect gate quantization bits from tensor shape
-        // gate weight shape: [num_experts, hidden_dim/vals_per_u32]
-        // For 4-bit: packed_cols = hidden_dim/8, for 8-bit: packed_cols = hidden_dim/4
-        lc->gate_bits = g_cfg->bits;
-        {
+        if (IS_DENSE) {
+            // Dense MLP path (e.g. Qwen3.5-9B): no router, no shared expert,
+            // no shared_expert_gate. Reuse the sg_/su_/sd_ slots so the
+            // downstream "shared expert" forward path can serve as the dense
+            // MLP forward path unchanged.
+            lc->gate_w = NULL; lc->gate_s = NULL; lc->gate_b = NULL;
+            lc->gate_bits = g_cfg->bits;
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.weight", i);
+            lc->sg_w = get_tensor_ptr(wf, name);
+            lc->shared_gate_up_bits = get_tensor_bits(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.scales", i);
+            lc->sg_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate_proj.biases", i);
+            lc->sg_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.weight", i);
+            lc->su_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.scales", i);
+            lc->su_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.up_proj.biases", i);
+            lc->su_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.weight", i);
+            lc->sd_w = get_tensor_ptr(wf, name);
+            lc->shared_down_bits = get_tensor_bits(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.scales", i);
+            lc->sd_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.down_proj.biases", i);
+            lc->sd_b = get_tensor_ptr(wf, name);
+            // No shared_expert_gate for dense models
+            lc->seg_w = NULL; lc->seg_s = NULL; lc->seg_b = NULL;
+            lc->seg_bits = g_cfg->bits;
+        } else {
+            // MoE weights (same for all layers)
             snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
-            TensorInfo *gi = get_tensor_info(wf, name);
-            if (gi && gi->ndim >= 2 && gi->shape[1] > 0) {
-                int packed_cols = gi->shape[1];
-                int expected_4bit = HIDDEN_DIM / 8;
-                int expected_8bit = HIDDEN_DIM / 4;
-                if (packed_cols == expected_8bit) lc->gate_bits = 8;
-                else if (packed_cols == expected_4bit) lc->gate_bits = 4;
+            lc->gate_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.scales", i);
+            lc->gate_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.biases", i);
+            lc->gate_b = get_tensor_ptr(wf, name);
+            // Detect gate quantization bits from tensor shape
+            // gate weight shape: [num_experts, hidden_dim/vals_per_u32]
+            // For 4-bit: packed_cols = hidden_dim/8, for 8-bit: packed_cols = hidden_dim/4
+            lc->gate_bits = g_cfg->bits;
+            {
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.gate.weight", i);
+                TensorInfo *gi = get_tensor_info(wf, name);
+                if (gi && gi->ndim >= 2 && gi->shape[1] > 0) {
+                    int packed_cols = gi->shape[1];
+                    int expected_4bit = HIDDEN_DIM / 8;
+                    int expected_8bit = HIDDEN_DIM / 4;
+                    if (packed_cols == expected_8bit) lc->gate_bits = 8;
+                    else if (packed_cols == expected_4bit) lc->gate_bits = 4;
+                }
             }
-        }
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
-        lc->sg_w = get_tensor_ptr(wf, name);
-        lc->shared_gate_up_bits = get_tensor_bits(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
-        lc->sg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
-        lc->sg_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
-        lc->su_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
-        lc->su_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
-        lc->su_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
-        lc->sd_w = get_tensor_ptr(wf, name);
-        lc->shared_down_bits = get_tensor_bits(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
-        lc->sd_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
-        lc->sd_b = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
-        lc->seg_w = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
-        lc->seg_s = get_tensor_ptr(wf, name);
-        snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
-        lc->seg_b = get_tensor_ptr(wf, name);
-        // Detect shared_expert_gate bits
-        lc->seg_bits = g_cfg->bits;
-        {
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.weight", i);
+            lc->sg_w = get_tensor_ptr(wf, name);
+            lc->shared_gate_up_bits = get_tensor_bits(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.scales", i);
+            lc->sg_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.gate_proj.biases", i);
+            lc->sg_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.weight", i);
+            lc->su_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.scales", i);
+            lc->su_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.up_proj.biases", i);
+            lc->su_b = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.weight", i);
+            lc->sd_w = get_tensor_ptr(wf, name);
+            lc->shared_down_bits = get_tensor_bits(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.scales", i);
+            lc->sd_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert.down_proj.biases", i);
+            lc->sd_b = get_tensor_ptr(wf, name);
             snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
-            TensorInfo *si = get_tensor_info(wf, name);
-            if (si && si->ndim >= 2 && si->shape[1] > 0) {
-                int packed_cols = si->shape[1];
-                int expected_8bit = HIDDEN_DIM / 4;
-                if (packed_cols == expected_8bit) lc->seg_bits = 8;
+            lc->seg_w = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.scales", i);
+            lc->seg_s = get_tensor_ptr(wf, name);
+            snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.biases", i);
+            lc->seg_b = get_tensor_ptr(wf, name);
+            // Detect shared_expert_gate bits
+            lc->seg_bits = g_cfg->bits;
+            {
+                snprintf(name, sizeof(name), "model.layers.%d.mlp.shared_expert_gate.weight", i);
+                TensorInfo *si = get_tensor_info(wf, name);
+                if (si && si->ndim >= 2 && si->shape[1] > 0) {
+                    int packed_cols = si->shape[1];
+                    int expected_8bit = HIDDEN_DIM / 4;
+                    if (packed_cols == expected_8bit) lc->seg_bits = 8;
+                }
             }
         }
     }
@@ -4478,10 +4530,11 @@ static void init_layer_scratch(void) {
     s_attn_proj  = calloc(HIDDEN_DIM, sizeof(float));
     s_h_post     = calloc(HIDDEN_DIM, sizeof(float));
     s_h_mid      = calloc(HIDDEN_DIM, sizeof(float));
-    s_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
-    s_spec_gate_scores = calloc(NUM_EXPERTS, sizeof(float));
-    s_shared_gate = calloc(SHARED_INTERMEDIATE, sizeof(float));
-    s_shared_up  = calloc(SHARED_INTERMEDIATE, sizeof(float));
+    // For dense models NUM_EXPERTS / SHARED_INTERMEDIATE may be 0 — alloc at least 1.
+    s_gate_scores      = calloc(NUM_EXPERTS > 0 ? NUM_EXPERTS : 1, sizeof(float));
+    s_spec_gate_scores = calloc(NUM_EXPERTS > 0 ? NUM_EXPERTS : 1, sizeof(float));
+    s_shared_gate      = calloc(SHARED_INTERMEDIATE > 0 ? SHARED_INTERMEDIATE : 1, sizeof(float));
+    s_shared_up        = calloc(SHARED_INTERMEDIATE > 0 ? SHARED_INTERMEDIATE : 1, sizeof(float));
     s_moe_out    = calloc(HIDDEN_DIM, sizeof(float));
     s_shared_out = calloc(HIDDEN_DIM, sizeof(float));
     s_q_proj_out = calloc(NUM_ATTN_HEADS * HEAD_DIM * 2, sizeof(float));
@@ -5375,6 +5428,10 @@ static void fused_layer_forward(
 
     int have_moe_weights = (gate_w && gate_s && gate_b && sgw && sgs && sgb &&
                             suw && sus && sub && seg_w && seg_s && seg_b);
+    // Dense models reuse the sg_/su_/sd_ slots for mlp.gate_proj/up_proj/down_proj.
+    // No router, no shared_expert_gate.
+    int is_dense = IS_DENSE;
+    int have_dense_mlp = (is_dense && sgw && sgs && sgb && suw && sus && sub && sdw && sds && sdb);
 
     // gpu_attn_fuse: attention dispatches fused into CMD2 (full-attn layers only).
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
@@ -5384,7 +5441,7 @@ static void fused_layer_forward(
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
         (oproj_s || lc->out_proj_bits == 16) &&  // Allow bf16 unquantized o_proj
-        g_metal && g_metal->wf_buf && have_moe_weights &&
+        g_metal && g_metal->wf_buf && (have_moe_weights || have_dense_mlp) &&
         g_metal->residual_add && g_metal->rms_norm_sum &&
         g_metal->rms_norm_apply_bf16 && lc->post_attn_norm_w) {
         // ---- FULLY FUSED CMD2 ----
@@ -5585,25 +5642,172 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 5-8: routing + shared expert projections (read buf_input) ----
-        BatchMatvecSpec moe_specs[4] = {
-            { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, lc->gate_bits },
-            { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, lc->shared_gate_up_bits },
-            { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, lc->shared_gate_up_bits },
-            { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, lc->seg_bits },
-        };
-        // buf_input already contains h_post from Enc 4 output -- no memcpy needed
-        gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        // ---- Enc 5+: MLP input projections (read buf_input = h_post) ----
+        if (is_dense) {
+            // Dense path: gate_proj + up_proj write directly into buf_shared_gate /
+            // buf_shared_up (resized to fit INTERMEDIATE_SIZE). No router, no
+            // shared_expert_gate, no batch_out roundtrip.
+            gpu_encode_dequant_matvec_with_io_bufs(
+                g_metal, cmd_fused, sgw, sgs, sgb,
+                g_metal->buf_input, g_metal->buf_shared_gate,
+                (uint32_t)INTERMEDIATE_SIZE, (uint32_t)HIDDEN_DIM, (uint32_t)GROUP_SIZE,
+                lc->shared_gate_up_bits);
+            gpu_encode_dequant_matvec_with_io_bufs(
+                g_metal, cmd_fused, suw, sus, sub,
+                g_metal->buf_input, g_metal->buf_shared_up,
+                (uint32_t)INTERMEDIATE_SIZE, (uint32_t)HIDDEN_DIM, (uint32_t)GROUP_SIZE,
+                lc->shared_gate_up_bits);
+        } else {
+            BatchMatvecSpec moe_specs[4] = {
+                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, lc->gate_bits },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, lc->shared_gate_up_bits },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, lc->shared_gate_up_bits },
+                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, lc->seg_bits },
+            };
+            // buf_input already contains h_post from Enc 4 output -- no memcpy needed
+            gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
+        }
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
 
-        // ---- Single commit+wait for all 8 encoders ----
+        // ---- Single commit+wait for all encoders ----
         if (g_timing_enabled) { t0 = now_ms(); }
         [cmd_fused commit];
         [cmd_fused waitUntilCompleted];
+        if (cmd_fused.error) {
+            fprintf(stderr, "[L%d] CMD2 ERROR: %s\n", layer_idx,
+                    [[cmd_fused.error description] UTF8String]);
+        }
 
-        // Read back results
-        gpu_flush_batch_results(g_metal, moe_specs, 4);
+        if (is_dense) {
+            // Dense: skip CPU routing, expert I/O, and CPU final combine entirely.
+            // Encode CMD3 = SwiGLU + down_proj + residual_add (+ next-layer norm if
+            // not the final layer). Defer commit so the next layer's CMD1 can submit
+            // immediately on the GPU's serial queue.
+            id<MTLCommandBuffer> cmd_dense = [g_metal->queue commandBuffer];
+
+            // SwiGLU: buf_shared_gate, buf_shared_up -> buf_shared_act (length INTERMEDIATE_SIZE)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->swiglu];
+                [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_shared_act  offset:0 atIndex:2];
+                uint32_t dim = (uint32_t)INTERMEDIATE_SIZE;
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t swiglu_tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(swiglu_tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // down_proj: buf_shared_act (INTERMEDIATE_SIZE) -> buf_shared_out (HIDDEN_DIM)
+            gpu_encode_dequant_matvec_with_io_bufs(
+                g_metal, cmd_dense, sdw, sds, sdb,
+                g_metal->buf_shared_act, g_metal->buf_shared_out,
+                (uint32_t)HIDDEN_DIM, (uint32_t)INTERMEDIATE_SIZE, (uint32_t)GROUP_SIZE,
+                lc->shared_down_bits);
+
+            // residual_add: buf_h_mid + buf_shared_out -> buf_moe_hidden
+            // (this is the new residual stream after the MLP)
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_h_mid       offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_shared_out  offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_moe_hidden  offset:0 atIndex:2];
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+
+            // For non-last layers: fuse the next layer's input_norm into this CMD3
+            // so the next layer can skip deferred_wait + CPU norm and submit CMD1
+            // immediately. (Same fast-path trick as the MoE GPU-combine tail.)
+            //
+            // For the LAST layer there's no next-layer norm to fuse. We still
+            // mark `dense_gpu_combined=1` so finalize_deferred_experts() takes
+            // its short gpu_combined path (memcpy buf_moe_hidden -> hidden) —
+            // the alternative CPU-combine path expects MoE-shaped state we
+            // don't have. `next_norm_fused` controls whether the next-layer
+            // input-norm encoders are appended.
+            int next_norm_fused = (g_metal->rms_norm_sum &&
+                                   g_metal->rms_norm_apply_bf16 &&
+                                   g_metal->wf_buf &&
+                                   layer_idx < NUM_LAYERS - 1 &&
+                                   layer_cache[layer_idx + 1].input_norm_w != NULL);
+            int gpu_combine = 1;  // dense always uses the gpu_combined finalize path
+
+            if (next_norm_fused) {
+                // rms_norm_sum_sq: buf_moe_hidden -> buf_cmd3_sum_sq
+                {
+                    id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+                    uint32_t dim = HIDDEN_DIM;
+                    [enc setComputePipelineState:g_metal->rms_norm_sum];
+                    [enc setBuffer:g_metal->buf_moe_hidden  offset:0 atIndex:0];
+                    [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0 atIndex:1];
+                    [enc setBytes:&dim length:4 atIndex:2];
+                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+                // rms_norm_apply_bf16: buf_moe_hidden + next_norm_w -> buf_input
+                {
+                    uint16_t *next_norm_w = layer_cache[layer_idx + 1].input_norm_w;
+                    NSUInteger norm_off = (NSUInteger)((const char *)next_norm_w -
+                                                       (const char *)[g_metal->wf_buf contents]);
+                    id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+                    uint32_t dim = HIDDEN_DIM;
+                    float eps = RMS_NORM_EPS;
+                    [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                    [enc setBuffer:g_metal->buf_moe_hidden  offset:0       atIndex:0];
+                    [enc setBuffer:g_metal->wf_buf          offset:norm_off atIndex:1];
+                    [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0       atIndex:2];
+                    [enc setBuffer:g_metal->buf_input       offset:0       atIndex:3];
+                    [enc setBytes:&dim length:4 atIndex:4];
+                    [enc setBytes:&eps length:4 atIndex:5];
+                    uint32_t tgs = (dim + 255) / 256;
+                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    [enc endEncoding];
+                }
+            }
+
+            [cmd_dense commit];
+
+            if (g_timing_enabled) {
+                t1 = now_ms();
+                g_timing.cmd2_wait += t1 - t0;
+                g_timing.cmd3_encode += 0;  // negligible
+                g_timing.count++;
+                g_timing.total += t1 - t_layer_start;
+            }
+
+            // Save deferred state. finalize_deferred_experts() will read
+            // buf_moe_hidden -> hidden (the residual stream for the next layer).
+            g_deferred.active = 1;
+            g_deferred.gpu_combined = gpu_combine;
+            g_deferred.cmd_experts = cmd_dense;
+            g_deferred.actual_K = 0;
+            g_deferred.shared_gate_score = 0.0f;
+            g_deferred.hidden = hidden;
+            g_deferred.layer_idx = layer_idx;
+            return;
+        }
+
+        // Read back results (MoE only)
+        {
+            BatchMatvecSpec moe_specs[4] = {
+                { gate_w, gate_s, gate_b, gate_scores,        (uint32_t)NUM_EXPERTS,        HIDDEN_DIM, GROUP_SIZE, 0, lc->gate_bits },
+                { sgw,    sgs,    sgb,    shared_gate,         (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 1, lc->shared_gate_up_bits },
+                { suw,    sus,    sub,    shared_up,           (uint32_t)SHARED_INTERMEDIATE, HIDDEN_DIM, GROUP_SIZE, 2, lc->shared_gate_up_bits },
+                { seg_w,  seg_s,  seg_b,  &shared_gate_score,  1,                            HIDDEN_DIM, GROUP_SIZE, 3, lc->seg_bits },
+            };
+            gpu_flush_batch_results(g_metal, moe_specs, 4);
+        }
         // Read h_mid from GPU buffer (needed for final combine)
         memcpy(h_mid, [g_metal->buf_h_mid contents], HIDDEN_DIM * sizeof(float));
         // Read h_post from buf_input (needed for expert input)
@@ -7406,8 +7610,8 @@ int main(int argc, char **argv) {
             printf("\n");
         }
 
-        // ---- Auto-detect 2-bit experts ----
-        if (!g_use_2bit) {
+        // ---- Auto-detect 2-bit experts (MoE only) ----
+        if (!g_use_2bit && !IS_DENSE) {
             char probe[1024];
             snprintf(probe, sizeof(probe), "%s/packed_experts_2bit/layer_00.bin", model_path);
             int pfd = open(probe, O_RDONLY);
@@ -7438,10 +7642,12 @@ int main(int argc, char **argv) {
         size_t *layer_mmap_sizes = calloc(NUM_LAYERS, sizeof(size_t));
         int expert_layers_available = 0;
 
-        // Reset the global seen-expert bitset
-        memset(g_expert_seen, 0, (size_t)NUM_LAYERS * ((NUM_EXPERTS + 7) / 8) * sizeof(uint8_t));
+        // Reset the global seen-expert bitset (MoE only)
+        if (!IS_DENSE) {
+            memset(g_expert_seen, 0, (size_t)NUM_LAYERS * ((NUM_EXPERTS + 7) / 8) * sizeof(uint8_t));
+        }
 
-        for (int i = 0; i < NUM_LAYERS; i++) {
+        for (int i = 0; i < NUM_LAYERS && !IS_DENSE; i++) {
             char path[1024];
             snprintf(path, sizeof(path), "%s/%s/layer_%02d.bin", model_path,
                      g_use_2bit ? "packed_experts_2bit" : "packed_experts", i);

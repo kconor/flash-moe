@@ -55,9 +55,16 @@ def main():
             f.write(struct.pack('<H', len(b)))
             f.write(b)
 
-        # Merges
+        # Merges. HuggingFace tokenizers used to store these as list-of-pairs
+        # ([["Ġ", "Ġ"], ...]) but newer versions store them as space-separated
+        # strings (["Ġ Ġ", ...]). Support both.
         for pair in merges:
-            a, b = pair[0], pair[1]
+            if isinstance(pair, str):
+                # Newer format: split on the FIRST space only — some merges
+                # contain a literal space character on either side.
+                a, b = pair.split(' ', 1)
+            else:
+                a, b = pair[0], pair[1]
             ab = a.encode('utf-8')
             bb = b.encode('utf-8')
             f.write(struct.pack('<H', len(ab)))

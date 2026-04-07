@@ -150,6 +150,10 @@ def main():
         san_name = sanitize_name(name)
         all_tensors.append((san_name, name, tensors_to_extract[name]))
 
+    # Detect dense vs MoE: dense models have neither num_experts nor num_local_experts
+    is_dense = ("num_experts" not in model_config
+                and "num_local_experts" not in model_config)
+
     # Write binary file
     bin_path = output_dir / 'model_weights.bin'
     manifest = {
@@ -165,10 +169,13 @@ def main():
             "head_dim": model_config.get("head_dim", 256),
             "vocab_size": model_config.get("vocab_size", 248320),
             "rms_norm_eps": model_config.get("rms_norm_eps", 1e-6),
-            "num_experts": model_config.get("num_experts", 512),
-            "num_experts_per_tok": model_config.get("num_experts_per_tok", 10),
-            "moe_intermediate_size": model_config.get("moe_intermediate_size", 1024),
-            "shared_expert_intermediate_size": model_config.get("shared_expert_intermediate_size", 1024),
+            # MoE fields: 0 for dense models, real values for MoE
+            "num_experts": 0 if is_dense else model_config.get("num_experts", 512),
+            "num_experts_per_tok": 0 if is_dense else model_config.get("num_experts_per_tok", 10),
+            "moe_intermediate_size": 0 if is_dense else model_config.get("moe_intermediate_size", 1024),
+            "shared_expert_intermediate_size": 0 if is_dense else model_config.get("shared_expert_intermediate_size", 1024),
+            # Dense FFN intermediate dim (0 for MoE models that don't use it)
+            "intermediate_size": model_config.get("intermediate_size", 0),
             "full_attention_interval": model_config.get("full_attention_interval", 4),
             "linear_num_value_heads": model_config.get("linear_num_value_heads", 64),
             "linear_num_key_heads": model_config.get("linear_num_key_heads", 16),
@@ -181,6 +188,8 @@ def main():
             "quantization_bits": quant_config.get("bits", 4),
         }
     }
+    if is_dense:
+        print(f"Dense model detected: intermediate_size={manifest['config']['intermediate_size']}")
 
     # Detect mixed-precision expert quantization (e.g. Unsloth Dynamic)
     # Look for switch_mlp.down_proj override with different bit width

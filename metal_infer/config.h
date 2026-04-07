@@ -38,6 +38,9 @@ typedef struct {
     int moe_intermediate;
     int shared_intermediate;
 
+    // Dense FFN (used when num_experts == 0)
+    int intermediate_size;
+
     // Attention pattern
     int full_attn_interval;
     int num_full_attn_layers;   // computed: num_layers / full_attn_interval
@@ -150,6 +153,15 @@ static inline void model_config_compute(ModelConfig *cfg) {
     // Resolve down_bits: 0 means same as bits
     int eff_down_bits = cfg->down_bits > 0 ? cfg->down_bits : cfg->bits;
 
+    // Dense models have no experts — skip expert layout computation entirely.
+    if (cfg->num_experts == 0) {
+        printf("[config] Dense model: %d layers (%d linear + %d full-attn), "
+               "hidden=%d, intermediate=%d, bits=%d\n",
+               cfg->num_layers, cfg->num_linear_layers, cfg->num_full_attn_layers,
+               cfg->hidden_dim, cfg->intermediate_size, cfg->bits);
+        return;
+    }
+
     // Primary expert layout (cfg->bits for gate/up, eff_down_bits for down)
     compute_expert_layout_bits(
         cfg->hidden_dim, cfg->moe_intermediate, cfg->group_size, cfg->bits, eff_down_bits,
@@ -235,6 +247,8 @@ static inline ModelConfig *model_config_default(void) {
 #define NUM_EXPERTS_PER_TOK (g_cfg->num_experts_per_tok)
 #define MOE_INTERMEDIATE    (g_cfg->moe_intermediate)
 #define SHARED_INTERMEDIATE (g_cfg->shared_intermediate)
+#define INTERMEDIATE_SIZE   (g_cfg->intermediate_size)
+#define IS_DENSE            (g_cfg->num_experts == 0)
 #define FULL_ATTN_INTERVAL  (g_cfg->full_attn_interval)
 #define GROUP_SIZE          (g_cfg->group_size)
 #define BITS                (g_cfg->bits)
