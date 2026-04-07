@@ -558,6 +558,541 @@ kernel void dequant_matvec_8bit(
     }
 }
 
+// ============================================================================
+// Kernel 1g_opt: 8-bit affine dequant matvec — multi-row SIMD (MLX-style)
+// ============================================================================
+// Each SIMD group (32 lanes) computes 4 output rows in parallel, sharing one
+// load of the x cache across all 4 rows. 8 SIMD groups/TG × 4 rows = 32 rows/TG.
+// Uses the affine decomposition:
+//     out[r] = sum_g ( scale[r,g] * dot(w_int[r,g], x[g]) + bias[r,g] * sum(x[g]) )
+// The scale*x / bias*x precompute is replaced with one mul per row per col
+// (for the int*x dot) + one fma per col per row (for scale*dot + bias*sum_x).
+// For gate/up/qkv matmuls (in_dim=4096, out_dim=4096..12288), this cuts the
+// number of threadgroups by 4× (and therefore the number of x_shared loads
+// from global memory by 4×), which is the dominant win.
+
+#define ROWS_PER_SIMD_8BIT 4
+#define SIMDS_PER_TG_8BIT 8
+#define ROWS_PER_TG_8BIT_OPT (ROWS_PER_SIMD_8BIT * SIMDS_PER_TG_8BIT)  // 32
+
+kernel void dequant_matvec_8bit_opt(
+    device const uint32_t* W_packed   [[buffer(0)]],  // [out_dim, in_dim/4]
+    device const uint16_t* scales     [[buffer(1)]],  // [out_dim, num_groups] bf16
+    device const uint16_t* biases     [[buffer(2)]],  // [out_dim, num_groups] bf16
+    device const float*    x          [[buffer(3)]],  // [in_dim]
+    device float*          out        [[buffer(4)]],  // [out_dim]
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Cache input vector in threadgroup shared memory (once per TG).
+    threadgroup float x_shared[4096];
+    uint tg_threads = SIMDS_PER_TG_8BIT * 32;  // 64 or 256
+    for (uint i = lid; i < in_dim; i += tg_threads) {
+        x_shared[i] = x[i];
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_base = tgid * ROWS_PER_TG_8BIT_OPT + simd_group * ROWS_PER_SIMD_8BIT;
+    if (row_base >= out_dim) return;
+
+    uint packed_cols    = in_dim / 4;              // uint32 columns per row
+    uint num_groups     = in_dim / group_size;
+    uint packs_per_group = group_size / 4;         // 16 for group_size=64
+
+    // Clamp tail rows to keep reads in-bounds if out_dim is not a multiple of 4.
+    uint r0 = row_base + 0;
+    uint r1 = min(row_base + 1, out_dim - 1);
+    uint r2 = min(row_base + 2, out_dim - 1);
+    uint r3 = min(row_base + 3, out_dim - 1);
+
+    // Row pointers for the (up to) 4 output rows handled by this SIMD group.
+    device const uint32_t* w0 = W_packed + r0 * packed_cols;
+    device const uint32_t* w1 = W_packed + r1 * packed_cols;
+    device const uint32_t* w2 = W_packed + r2 * packed_cols;
+    device const uint32_t* w3 = W_packed + r3 * packed_cols;
+    device const uint16_t* s0 = scales + r0 * num_groups;
+    device const uint16_t* s1 = scales + r1 * num_groups;
+    device const uint16_t* s2 = scales + r2 * num_groups;
+    device const uint16_t* s3 = scales + r3 * num_groups;
+    device const uint16_t* b0 = biases + r0 * num_groups;
+    device const uint16_t* b1 = biases + r1 * num_groups;
+    device const uint16_t* b2 = biases + r2 * num_groups;
+    device const uint16_t* b3 = biases + r3 * num_groups;
+
+    float4 acc = float4(0.0);
+
+    // Stride-32 uint32 loads (lower register pressure than uint4). 4 values
+    // per iteration per lane, amortizing scale/bias loads across 16 packed
+    // columns per group. For the 9B's HIDDEN_DIM=4096 input, each lane does
+    // packed_cols/32 = 32 iterations.
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / packs_per_group;
+
+        threadgroup const float4* xp = (threadgroup const float4*)(x_shared + col * 4);
+        float4 xv = *xp;
+        float x_sum = xv.x + xv.y + xv.z + xv.w;
+
+        float4 scale = float4(
+            bf16_to_f32(s0[g]), bf16_to_f32(s1[g]),
+            bf16_to_f32(s2[g]), bf16_to_f32(s3[g]));
+        float4 bias = float4(
+            bf16_to_f32(b0[g]), bf16_to_f32(b1[g]),
+            bf16_to_f32(b2[g]), bf16_to_f32(b3[g]));
+
+        uint p0 = w0[col];
+        uint p1 = w1[col];
+        uint p2 = w2[col];
+        uint p3 = w3[col];
+
+        float d0 = float((p0      ) & 0xFF) * xv.x
+                 + float((p0 >>  8) & 0xFF) * xv.y
+                 + float((p0 >> 16) & 0xFF) * xv.z
+                 + float((p0 >> 24) & 0xFF) * xv.w;
+        float d1 = float((p1      ) & 0xFF) * xv.x
+                 + float((p1 >>  8) & 0xFF) * xv.y
+                 + float((p1 >> 16) & 0xFF) * xv.z
+                 + float((p1 >> 24) & 0xFF) * xv.w;
+        float d2 = float((p2      ) & 0xFF) * xv.x
+                 + float((p2 >>  8) & 0xFF) * xv.y
+                 + float((p2 >> 16) & 0xFF) * xv.z
+                 + float((p2 >> 24) & 0xFF) * xv.w;
+        float d3 = float((p3      ) & 0xFF) * xv.x
+                 + float((p3 >>  8) & 0xFF) * xv.y
+                 + float((p3 >> 16) & 0xFF) * xv.z
+                 + float((p3 >> 24) & 0xFF) * xv.w;
+
+        acc.x = fma(scale.x, d0, fma(bias.x, x_sum, acc.x));
+        acc.y = fma(scale.y, d1, fma(bias.y, x_sum, acc.y));
+        acc.z = fma(scale.z, d2, fma(bias.z, x_sum, acc.z));
+        acc.w = fma(scale.w, d3, fma(bias.w, x_sum, acc.w));
+    }
+
+    // Per-row SIMD reduction.
+    acc.x = simd_sum(acc.x);
+    acc.y = simd_sum(acc.y);
+    acc.z = simd_sum(acc.z);
+    acc.w = simd_sum(acc.w);
+
+    if (simd_lane == 0) {
+        // Bounds-check the writes in case out_dim is not a multiple of 4.
+        if (row_base + 0 < out_dim) out[row_base + 0] = acc.x;
+        if (row_base + 1 < out_dim) out[row_base + 1] = acc.y;
+        if (row_base + 2 < out_dim) out[row_base + 2] = acc.z;
+        if (row_base + 3 < out_dim) out[row_base + 3] = acc.w;
+    }
+}
+
+
+// ============================================================================
+// 8-bit matvec for large in_dim (> 4096) — multi-row SIMD, no shared x cache.
+// ============================================================================
+// Same multi-row pattern as dequant_matvec_8bit_opt but without the threadgroup
+// x cache (the input is too big to fit in shared memory). Each SIMD group
+// computes 4 output rows in parallel, using thread registers for x; x is still
+// re-read per SIMD group within the TG (no way to avoid that without shared).
+//
+// Primarily used for down_proj (4096×12288) in dense FFNs at large intermediate
+// sizes.
+
+// ============================================================================
+// Fused gate_proj + up_proj for dense MLPs. Both matmuls share the same
+// input x, so we share the threadgroup x cache and cut the number of
+// threadgroups in half (each TG produces 32 gate rows AND 32 up rows).
+// Saves one dispatch and ~half the x-cache fill bandwidth.
+kernel void dequant_matvec_8bit_gate_up(
+    device const uint32_t* W_gate     [[buffer(0)]],
+    device const uint16_t* S_gate     [[buffer(1)]],
+    device const uint16_t* B_gate     [[buffer(2)]],
+    device const uint32_t* W_up       [[buffer(3)]],
+    device const uint16_t* S_up       [[buffer(4)]],
+    device const uint16_t* B_up       [[buffer(5)]],
+    device const float*    x          [[buffer(6)]],
+    device float*          out_gate   [[buffer(7)]],
+    device float*          out_up     [[buffer(8)]],
+    constant uint&         out_dim    [[buffer(9)]],
+    constant uint&         in_dim     [[buffer(10)]],
+    constant uint&         group_size [[buffer(11)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    uint row_base = tgid * 32 + simd_group * 4;
+    if (row_base >= out_dim) return;
+
+    uint packed_cols     = in_dim / 4;
+    uint num_groups      = in_dim / group_size;
+    uint packs_per_group = group_size / 4;
+
+    uint r0 = row_base + 0;
+    uint r1 = min(row_base + 1, out_dim - 1);
+    uint r2 = min(row_base + 2, out_dim - 1);
+    uint r3 = min(row_base + 3, out_dim - 1);
+
+    device const uint32_t* wg0 = W_gate + r0 * packed_cols;
+    device const uint32_t* wg1 = W_gate + r1 * packed_cols;
+    device const uint32_t* wg2 = W_gate + r2 * packed_cols;
+    device const uint32_t* wg3 = W_gate + r3 * packed_cols;
+    device const uint32_t* wu0 = W_up + r0 * packed_cols;
+    device const uint32_t* wu1 = W_up + r1 * packed_cols;
+    device const uint32_t* wu2 = W_up + r2 * packed_cols;
+    device const uint32_t* wu3 = W_up + r3 * packed_cols;
+
+    device const uint16_t* sg0 = S_gate + r0 * num_groups;
+    device const uint16_t* sg1 = S_gate + r1 * num_groups;
+    device const uint16_t* sg2 = S_gate + r2 * num_groups;
+    device const uint16_t* sg3 = S_gate + r3 * num_groups;
+    device const uint16_t* bg0 = B_gate + r0 * num_groups;
+    device const uint16_t* bg1 = B_gate + r1 * num_groups;
+    device const uint16_t* bg2 = B_gate + r2 * num_groups;
+    device const uint16_t* bg3 = B_gate + r3 * num_groups;
+
+    device const uint16_t* su0 = S_up + r0 * num_groups;
+    device const uint16_t* su1 = S_up + r1 * num_groups;
+    device const uint16_t* su2 = S_up + r2 * num_groups;
+    device const uint16_t* su3 = S_up + r3 * num_groups;
+    device const uint16_t* bu0 = B_up + r0 * num_groups;
+    device const uint16_t* bu1 = B_up + r1 * num_groups;
+    device const uint16_t* bu2 = B_up + r2 * num_groups;
+    device const uint16_t* bu3 = B_up + r3 * num_groups;
+
+    float4 acc_g = float4(0.0);
+    float4 acc_u = float4(0.0);
+
+    for (uint col = simd_lane; col < packed_cols; col += 32) {
+        uint g = col / packs_per_group;
+
+        threadgroup const float4* xp = (threadgroup const float4*)(x_shared + col * 4);
+        float4 xv = *xp;
+        float x_sum = xv.x + xv.y + xv.z + xv.w;
+
+        float4 scale_g = float4(
+            bf16_to_f32(sg0[g]), bf16_to_f32(sg1[g]),
+            bf16_to_f32(sg2[g]), bf16_to_f32(sg3[g]));
+        float4 bias_g = float4(
+            bf16_to_f32(bg0[g]), bf16_to_f32(bg1[g]),
+            bf16_to_f32(bg2[g]), bf16_to_f32(bg3[g]));
+        float4 scale_u = float4(
+            bf16_to_f32(su0[g]), bf16_to_f32(su1[g]),
+            bf16_to_f32(su2[g]), bf16_to_f32(su3[g]));
+        float4 bias_u = float4(
+            bf16_to_f32(bu0[g]), bf16_to_f32(bu1[g]),
+            bf16_to_f32(bu2[g]), bf16_to_f32(bu3[g]));
+
+        uint pg0 = wg0[col], pg1 = wg1[col], pg2 = wg2[col], pg3 = wg3[col];
+        uint pu0 = wu0[col], pu1 = wu1[col], pu2 = wu2[col], pu3 = wu3[col];
+
+        #define Q8DOT(p, xv) \
+            (float((p) & 0xFF) * xv.x + \
+             float(((p) >> 8) & 0xFF) * xv.y + \
+             float(((p) >> 16) & 0xFF) * xv.z + \
+             float(((p) >> 24) & 0xFF) * xv.w)
+
+        float d0g = Q8DOT(pg0, xv);
+        float d1g = Q8DOT(pg1, xv);
+        float d2g = Q8DOT(pg2, xv);
+        float d3g = Q8DOT(pg3, xv);
+        float d0u = Q8DOT(pu0, xv);
+        float d1u = Q8DOT(pu1, xv);
+        float d2u = Q8DOT(pu2, xv);
+        float d3u = Q8DOT(pu3, xv);
+        #undef Q8DOT
+
+        acc_g.x = fma(scale_g.x, d0g, fma(bias_g.x, x_sum, acc_g.x));
+        acc_g.y = fma(scale_g.y, d1g, fma(bias_g.y, x_sum, acc_g.y));
+        acc_g.z = fma(scale_g.z, d2g, fma(bias_g.z, x_sum, acc_g.z));
+        acc_g.w = fma(scale_g.w, d3g, fma(bias_g.w, x_sum, acc_g.w));
+        acc_u.x = fma(scale_u.x, d0u, fma(bias_u.x, x_sum, acc_u.x));
+        acc_u.y = fma(scale_u.y, d1u, fma(bias_u.y, x_sum, acc_u.y));
+        acc_u.z = fma(scale_u.z, d2u, fma(bias_u.z, x_sum, acc_u.z));
+        acc_u.w = fma(scale_u.w, d3u, fma(bias_u.w, x_sum, acc_u.w));
+    }
+
+    acc_g.x = simd_sum(acc_g.x);
+    acc_g.y = simd_sum(acc_g.y);
+    acc_g.z = simd_sum(acc_g.z);
+    acc_g.w = simd_sum(acc_g.w);
+    acc_u.x = simd_sum(acc_u.x);
+    acc_u.y = simd_sum(acc_u.y);
+    acc_u.z = simd_sum(acc_u.z);
+    acc_u.w = simd_sum(acc_u.w);
+
+    if (simd_lane == 0) {
+        if (row_base + 0 < out_dim) { out_gate[row_base + 0] = acc_g.x; out_up[row_base + 0] = acc_u.x; }
+        if (row_base + 1 < out_dim) { out_gate[row_base + 1] = acc_g.y; out_up[row_base + 1] = acc_u.y; }
+        if (row_base + 2 < out_dim) { out_gate[row_base + 2] = acc_g.z; out_up[row_base + 2] = acc_u.z; }
+        if (row_base + 3 < out_dim) { out_gate[row_base + 3] = acc_g.w; out_up[row_base + 3] = acc_u.w; }
+    }
+}
+
+
+// ============================================================================
+// Fused SwiGLU + dequant matvec (Q8) for the down_proj slot in dense MLPs.
+// Reads gate[] and up[] directly instead of a pre-computed swiglu buffer.
+// Each input position: act_i = silu(gate[i]) * up[i] computed inline, then
+// dotted with the Q8 down_proj weights. Saves:
+//   - one swiglu dispatch
+//   - one intermediate buffer (buf_shared_act) write + read
+// Same tiled x-cache structure as dequant_matvec_8bit_fast_opt.
+kernel void dequant_matvec_8bit_fast_swiglu_down(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    gate_in    [[buffer(3)]],  // buf_shared_gate
+    device const float*    up_in      [[buffer(4)]],  // buf_shared_up
+    device float*          out        [[buffer(5)]],  // buf_shared_out
+    constant uint&         out_dim    [[buffer(6)]],
+    constant uint&         in_dim     [[buffer(7)]],
+    constant uint&         group_size [[buffer(8)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_tile[4096];  // holds swiglu(gate, up) for current tile
+
+    uint row_base = tgid * ROWS_PER_TG_8BIT_OPT + simd_group * ROWS_PER_SIMD_8BIT;
+    uint packed_cols    = in_dim / 4;
+    uint num_groups     = in_dim / group_size;
+    uint packs_per_group = group_size / 4;
+
+    uint r0 = row_base + 0;
+    uint r1 = min(row_base + 1, out_dim - 1);
+    uint r2 = min(row_base + 2, out_dim - 1);
+    uint r3 = min(row_base + 3, out_dim - 1);
+
+    bool row_active = (row_base < out_dim);
+
+    device const uint32_t* w0 = W_packed + r0 * packed_cols;
+    device const uint32_t* w1 = W_packed + r1 * packed_cols;
+    device const uint32_t* w2 = W_packed + r2 * packed_cols;
+    device const uint32_t* w3 = W_packed + r3 * packed_cols;
+    device const uint16_t* s0 = scales + r0 * num_groups;
+    device const uint16_t* s1 = scales + r1 * num_groups;
+    device const uint16_t* s2 = scales + r2 * num_groups;
+    device const uint16_t* s3 = scales + r3 * num_groups;
+    device const uint16_t* b0 = biases + r0 * num_groups;
+    device const uint16_t* b1 = biases + r1 * num_groups;
+    device const uint16_t* b2 = biases + r2 * num_groups;
+    device const uint16_t* b3 = biases + r3 * num_groups;
+
+    float4 acc = float4(0.0);
+
+    const uint TILE = 4096;
+
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += TILE) {
+        uint tile_len = min(TILE, in_dim - tile_base);
+
+        // Cooperative load of swiglu(gate, up)[tile_base .. tile_base+tile_len).
+        for (uint i = lid; i < tile_len; i += 256) {
+            float g = gate_in[tile_base + i];
+            float u = up_in[tile_base + i];
+            // silu(g) * u = (g / (1 + exp(-g))) * u
+            float sig = 1.0f / (1.0f + exp(-g));
+            x_tile[i] = g * sig * u;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row_active) {
+            uint tile_packed = tile_len / 4;
+            uint col_start = tile_base / 4;
+            for (uint col = simd_lane; col < tile_packed; col += 32) {
+                uint abs_col = col_start + col;
+                uint g = abs_col / packs_per_group;
+
+                threadgroup const float4* xp = (threadgroup const float4*)(x_tile + col * 4);
+                float4 xvals = *xp;
+                float x_sum = xvals.x + xvals.y + xvals.z + xvals.w;
+
+                float4 scale = float4(
+                    bf16_to_f32(s0[g]), bf16_to_f32(s1[g]),
+                    bf16_to_f32(s2[g]), bf16_to_f32(s3[g]));
+                float4 bias = float4(
+                    bf16_to_f32(b0[g]), bf16_to_f32(b1[g]),
+                    bf16_to_f32(b2[g]), bf16_to_f32(b3[g]));
+
+                uint p0 = w0[abs_col];
+                uint p1 = w1[abs_col];
+                uint p2 = w2[abs_col];
+                uint p3 = w3[abs_col];
+
+                float d0 = float((p0      ) & 0xFF) * xvals.x
+                         + float((p0 >>  8) & 0xFF) * xvals.y
+                         + float((p0 >> 16) & 0xFF) * xvals.z
+                         + float((p0 >> 24) & 0xFF) * xvals.w;
+                float d1 = float((p1      ) & 0xFF) * xvals.x
+                         + float((p1 >>  8) & 0xFF) * xvals.y
+                         + float((p1 >> 16) & 0xFF) * xvals.z
+                         + float((p1 >> 24) & 0xFF) * xvals.w;
+                float d2 = float((p2      ) & 0xFF) * xvals.x
+                         + float((p2 >>  8) & 0xFF) * xvals.y
+                         + float((p2 >> 16) & 0xFF) * xvals.z
+                         + float((p2 >> 24) & 0xFF) * xvals.w;
+                float d3 = float((p3      ) & 0xFF) * xvals.x
+                         + float((p3 >>  8) & 0xFF) * xvals.y
+                         + float((p3 >> 16) & 0xFF) * xvals.z
+                         + float((p3 >> 24) & 0xFF) * xvals.w;
+
+                acc.x = fma(scale.x, d0, fma(bias.x, x_sum, acc.x));
+                acc.y = fma(scale.y, d1, fma(bias.y, x_sum, acc.y));
+                acc.z = fma(scale.z, d2, fma(bias.z, x_sum, acc.z));
+                acc.w = fma(scale.w, d3, fma(bias.w, x_sum, acc.w));
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (!row_active) return;
+
+    acc.x = simd_sum(acc.x);
+    acc.y = simd_sum(acc.y);
+    acc.z = simd_sum(acc.z);
+    acc.w = simd_sum(acc.w);
+
+    if (simd_lane == 0) {
+        if (row_base + 0 < out_dim) out[row_base + 0] = acc.x;
+        if (row_base + 1 < out_dim) out[row_base + 1] = acc.y;
+        if (row_base + 2 < out_dim) out[row_base + 2] = acc.z;
+        if (row_base + 3 < out_dim) out[row_base + 3] = acc.w;
+    }
+}
+
+// Tiled variant: x is too large for shared cache in one chunk (in_dim > 4096),
+// but we can process it in 4096-value tiles. Each tile caches its 16 KB of x
+// into threadgroup memory once, every SIMD group in the TG reads from that
+// cache, then advance to the next tile. For 32 rows/TG and 3 tiles (in_dim
+// 12288), x bandwidth from global is reduced by ~32x vs untiled.
+kernel void dequant_matvec_8bit_fast_opt(
+    device const uint32_t* W_packed   [[buffer(0)]],
+    device const uint16_t* scales     [[buffer(1)]],
+    device const uint16_t* biases     [[buffer(2)]],
+    device const float*    x          [[buffer(3)]],
+    device float*          out        [[buffer(4)]],
+    constant uint&         out_dim    [[buffer(5)]],
+    constant uint&         in_dim     [[buffer(6)]],
+    constant uint&         group_size [[buffer(7)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float x_tile[4096];  // one tile of x at a time
+
+    uint row_base = tgid * ROWS_PER_TG_8BIT_OPT + simd_group * ROWS_PER_SIMD_8BIT;
+    uint packed_cols    = in_dim / 4;
+    uint num_groups     = in_dim / group_size;
+    uint packs_per_group = group_size / 4;
+
+    uint r0 = row_base + 0;
+    uint r1 = min(row_base + 1, out_dim - 1);
+    uint r2 = min(row_base + 2, out_dim - 1);
+    uint r3 = min(row_base + 3, out_dim - 1);
+
+    // Bail out early? No — threads need to participate in the x_tile loads.
+    bool row_active = (row_base < out_dim);
+
+    device const uint32_t* w0 = W_packed + r0 * packed_cols;
+    device const uint32_t* w1 = W_packed + r1 * packed_cols;
+    device const uint32_t* w2 = W_packed + r2 * packed_cols;
+    device const uint32_t* w3 = W_packed + r3 * packed_cols;
+    device const uint16_t* s0 = scales + r0 * num_groups;
+    device const uint16_t* s1 = scales + r1 * num_groups;
+    device const uint16_t* s2 = scales + r2 * num_groups;
+    device const uint16_t* s3 = scales + r3 * num_groups;
+    device const uint16_t* b0 = biases + r0 * num_groups;
+    device const uint16_t* b1 = biases + r1 * num_groups;
+    device const uint16_t* b2 = biases + r2 * num_groups;
+    device const uint16_t* b3 = biases + r3 * num_groups;
+
+    float4 acc = float4(0.0);
+
+    const uint TILE = 4096;
+    const uint PACKED_PER_TILE = TILE / 4;  // 1024 uint32 per tile
+
+    for (uint tile_base = 0; tile_base < in_dim; tile_base += TILE) {
+        uint tile_len = min(TILE, in_dim - tile_base);
+
+        // Cooperative load of x_tile[0..tile_len).
+        for (uint i = lid; i < tile_len; i += 256) {
+            x_tile[i] = x[tile_base + i];
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+
+        if (row_active) {
+            uint tile_packed = tile_len / 4;
+            uint col_start = tile_base / 4;
+            for (uint col = simd_lane; col < tile_packed; col += 32) {
+                uint abs_col = col_start + col;
+                uint g = abs_col / packs_per_group;
+
+                threadgroup const float4* xp = (threadgroup const float4*)(x_tile + col * 4);
+                float4 xvals = *xp;
+                float x_sum = xvals.x + xvals.y + xvals.z + xvals.w;
+
+                float4 scale = float4(
+                    bf16_to_f32(s0[g]), bf16_to_f32(s1[g]),
+                    bf16_to_f32(s2[g]), bf16_to_f32(s3[g]));
+                float4 bias = float4(
+                    bf16_to_f32(b0[g]), bf16_to_f32(b1[g]),
+                    bf16_to_f32(b2[g]), bf16_to_f32(b3[g]));
+
+                uint p0 = w0[abs_col];
+                uint p1 = w1[abs_col];
+                uint p2 = w2[abs_col];
+                uint p3 = w3[abs_col];
+
+                float d0 = float((p0      ) & 0xFF) * xvals.x
+                         + float((p0 >>  8) & 0xFF) * xvals.y
+                         + float((p0 >> 16) & 0xFF) * xvals.z
+                         + float((p0 >> 24) & 0xFF) * xvals.w;
+                float d1 = float((p1      ) & 0xFF) * xvals.x
+                         + float((p1 >>  8) & 0xFF) * xvals.y
+                         + float((p1 >> 16) & 0xFF) * xvals.z
+                         + float((p1 >> 24) & 0xFF) * xvals.w;
+                float d2 = float((p2      ) & 0xFF) * xvals.x
+                         + float((p2 >>  8) & 0xFF) * xvals.y
+                         + float((p2 >> 16) & 0xFF) * xvals.z
+                         + float((p2 >> 24) & 0xFF) * xvals.w;
+                float d3 = float((p3      ) & 0xFF) * xvals.x
+                         + float((p3 >>  8) & 0xFF) * xvals.y
+                         + float((p3 >> 16) & 0xFF) * xvals.z
+                         + float((p3 >> 24) & 0xFF) * xvals.w;
+
+                acc.x = fma(scale.x, d0, fma(bias.x, x_sum, acc.x));
+                acc.y = fma(scale.y, d1, fma(bias.y, x_sum, acc.y));
+                acc.z = fma(scale.z, d2, fma(bias.z, x_sum, acc.z));
+                acc.w = fma(scale.w, d3, fma(bias.w, x_sum, acc.w));
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    if (!row_active) return;
+
+    acc.x = simd_sum(acc.x);
+    acc.y = simd_sum(acc.y);
+    acc.z = simd_sum(acc.z);
+    acc.w = simd_sum(acc.w);
+
+    if (simd_lane == 0) {
+        if (row_base + 0 < out_dim) out[row_base + 0] = acc.x;
+        if (row_base + 1 < out_dim) out[row_base + 1] = acc.y;
+        if (row_base + 2 < out_dim) out[row_base + 2] = acc.z;
+        if (row_base + 3 < out_dim) out[row_base + 3] = acc.w;
+    }
+}
+
 // 8-bit variant of matvec_fast (for in_dim > 4096, no shared memory cache)
 kernel void dequant_matvec_8bit_fast(
     device const uint32_t* W_packed   [[buffer(0)]],
@@ -1210,6 +1745,168 @@ kernel void bf16_matvec(
     }
 }
 
+// ============================================================================
+// BF16 matvec — multi-row SIMD variant (4 rows/SIMD, 32 rows/TG)
+// ============================================================================
+// Same optimization as dequant_matvec_8bit_opt: each SIMD group computes 4
+// output rows in parallel, reading x from threadgroup cache once. This cuts
+// the number of threadgroups by 4× and amortizes the x-cache load, which is
+// the only place where BF16 matvec output rows share memory traffic.
+
+kernel void bf16_matvec_opt(
+    device const uint16_t* W        [[buffer(0)]],
+    device const float*    x        [[buffer(1)]],
+    device float*          out      [[buffer(2)]],
+    constant uint&         out_dim  [[buffer(3)]],
+    constant uint&         in_dim   [[buffer(4)]],
+    uint tgid       [[threadgroup_position_in_grid]],
+    uint lid        [[thread_position_in_threadgroup]],
+    uint simd_lane  [[thread_index_in_simdgroup]],
+    uint simd_group [[simdgroup_index_in_threadgroup]]
+) {
+    // Cache x in shared memory. 16 KB keeps 2 TGs resident per core.
+    threadgroup float x_shared[4096];
+    for (uint i = lid; i < in_dim; i += 256) x_shared[i] = x[i];
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // 4 rows/SIMD × 8 SIMDs/TG = 32 rows/TG
+    uint row_base = tgid * 32 + simd_group * 4;
+    if (row_base >= out_dim) return;
+
+    uint r0 = row_base + 0;
+    uint r1 = min(row_base + 1, out_dim - 1);
+    uint r2 = min(row_base + 2, out_dim - 1);
+    uint r3 = min(row_base + 3, out_dim - 1);
+
+    // Use uint4 loads (16 bytes = 8 bf16 values per load) for better memory
+    // throughput. 2-byte loads are inefficient on Apple Silicon; 16-byte
+    // loads are the native transaction size.
+    device const uint4* w0v = (device const uint4*)(W + r0 * in_dim);
+    device const uint4* w1v = (device const uint4*)(W + r1 * in_dim);
+    device const uint4* w2v = (device const uint4*)(W + r2 * in_dim);
+    device const uint4* w3v = (device const uint4*)(W + r3 * in_dim);
+
+    float4 acc = float4(0.0);
+
+    // Each uint4 holds 8 bf16 values (4 uint32 × 2 bf16 each).
+    // in_dim / 8 = number of uint4 chunks per row.
+    uint in_vec = in_dim / 8;
+
+    for (uint v = simd_lane; v < in_vec; v += 32) {
+        // Load 8 x values corresponding to this uint4 of weights.
+        threadgroup const float4* xp = (threadgroup const float4*)(x_shared + v * 8);
+        float4 xv0 = xp[0];
+        float4 xv1 = xp[1];
+
+        uint4 p0 = w0v[v];
+        uint4 p1 = w1v[v];
+        uint4 p2 = w2v[v];
+        uint4 p3 = w3v[v];
+
+        // Each uint32 has 2 bf16 values: low 16 bits and high 16 bits.
+        // Row 0
+        acc.x = fma(bf16_to_f32(uint16_t(p0.x & 0xFFFF)), xv0.x, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.x >> 16)),    xv0.y, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.y & 0xFFFF)), xv0.z, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.y >> 16)),    xv0.w, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.z & 0xFFFF)), xv1.x, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.z >> 16)),    xv1.y, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.w & 0xFFFF)), xv1.z, acc.x);
+        acc.x = fma(bf16_to_f32(uint16_t(p0.w >> 16)),    xv1.w, acc.x);
+
+        // Row 1
+        acc.y = fma(bf16_to_f32(uint16_t(p1.x & 0xFFFF)), xv0.x, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.x >> 16)),    xv0.y, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.y & 0xFFFF)), xv0.z, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.y >> 16)),    xv0.w, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.z & 0xFFFF)), xv1.x, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.z >> 16)),    xv1.y, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.w & 0xFFFF)), xv1.z, acc.y);
+        acc.y = fma(bf16_to_f32(uint16_t(p1.w >> 16)),    xv1.w, acc.y);
+
+        // Row 2
+        acc.z = fma(bf16_to_f32(uint16_t(p2.x & 0xFFFF)), xv0.x, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.x >> 16)),    xv0.y, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.y & 0xFFFF)), xv0.z, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.y >> 16)),    xv0.w, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.z & 0xFFFF)), xv1.x, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.z >> 16)),    xv1.y, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.w & 0xFFFF)), xv1.z, acc.z);
+        acc.z = fma(bf16_to_f32(uint16_t(p2.w >> 16)),    xv1.w, acc.z);
+
+        // Row 3
+        acc.w = fma(bf16_to_f32(uint16_t(p3.x & 0xFFFF)), xv0.x, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.x >> 16)),    xv0.y, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.y & 0xFFFF)), xv0.z, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.y >> 16)),    xv0.w, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.z & 0xFFFF)), xv1.x, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.z >> 16)),    xv1.y, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.w & 0xFFFF)), xv1.z, acc.w);
+        acc.w = fma(bf16_to_f32(uint16_t(p3.w >> 16)),    xv1.w, acc.w);
+    }
+
+    acc.x = simd_sum(acc.x);
+    acc.y = simd_sum(acc.y);
+    acc.z = simd_sum(acc.z);
+    acc.w = simd_sum(acc.w);
+
+    if (simd_lane == 0) {
+        if (row_base + 0 < out_dim) out[row_base + 0] = acc.x;
+        if (row_base + 1 < out_dim) out[row_base + 1] = acc.y;
+        if (row_base + 2 < out_dim) out[row_base + 2] = acc.z;
+        if (row_base + 3 < out_dim) out[row_base + 3] = acc.w;
+    }
+}
+
+
+// Fused BF16 matvec for two small-out matrices sharing the same input.
+// Used for the linear-attention b/a projections in Qwen3.5-9B where each is
+// only [32, 4096] bf16 — too small to dispatch independently. Computes both
+// outputs in a single kernel launch, saving ~one dispatch worth of overhead.
+//
+// Dispatch: (out_dim) TGs, 64 threads each. Each TG computes ONE output row
+// for BOTH matrices. Lanes do a strided dot product and reduce via simd_sum.
+kernel void bf16_matvec_pair(
+    device const uint16_t* W_a      [[buffer(0)]],
+    device const uint16_t* W_b      [[buffer(1)]],
+    device const float*    x        [[buffer(2)]],
+    device float*          out_a    [[buffer(3)]],
+    device float*          out_b    [[buffer(4)]],
+    constant uint&         out_dim  [[buffer(5)]],
+    constant uint&         in_dim   [[buffer(6)]],
+    uint tgid [[threadgroup_position_in_grid]],
+    uint lid  [[thread_position_in_threadgroup]],
+    uint tg_size [[threads_per_threadgroup]]
+) {
+    if (tgid >= out_dim) return;
+
+    device const uint16_t* wa = W_a + tgid * in_dim;
+    device const uint16_t* wb = W_b + tgid * in_dim;
+
+    float acc_a = 0.0f, acc_b = 0.0f;
+    for (uint col = lid; col < in_dim; col += tg_size) {
+        float xv = x[col];
+        acc_a += bf16_to_f32(wa[col]) * xv;
+        acc_b += bf16_to_f32(wb[col]) * xv;
+    }
+
+    acc_a = simd_sum(acc_a);
+    acc_b = simd_sum(acc_b);
+
+    threadgroup float sh_a[2], sh_b[2];
+    uint simd_group = lid / 32;
+    if (lid % 32 == 0) { sh_a[simd_group] = acc_a; sh_b[simd_group] = acc_b; }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (lid == 0) {
+        float a_val = sh_a[0] + sh_a[1];
+        float b_val = sh_b[0] + sh_b[1];
+        out_a[tgid] = a_val;
+        out_b[tgid] = b_val;
+    }
+}
+
+
 // BF16 matvec for in_dim > 8192 (no shared memory)
 kernel void bf16_matvec_fast(
     device const uint16_t* W        [[buffer(0)]],
@@ -1415,6 +2112,158 @@ kernel void rms_norm_apply_bf16(
 // Used to fuse the residual connection into a GPU command buffer,
 // eliminating a CPU round-trip between o_proj and routing.
 
+// ============================================================================
+// Full-attention pre-processing on GPU: split q_proj into (q, gate), apply
+// per-head RMS norm, apply partial RoPE (MLX-style split-half pairing), and
+// write results into the GPU attention buffers. This eliminates the CPU
+// round-trip that was the biggest remaining per-layer CPU cost (~0.5 ms per
+// full-attn layer × 8 layers ≈ 4 ms/token).
+//
+// Implementation is two kernels — one for Q (which also carries the gate)
+// and one for K — so each kernel can cleanly do a threadgroup-level
+// reduction without branch-dependent barriers.
+//
+// Layout (Qwen3.5-9B):
+//   q_proj_out:      [num_q_heads, 2, head_dim] — for each head, q then gate
+//   k_out:           [num_kv_heads, head_dim]
+//   Partial RoPE:    rotary_dim = head_dim * 0.25; MLX pairs (i, i+rotary/2)
+
+kernel void q_norm_rope(
+    device const float*    q_proj_out [[buffer(0)]],  // [num_q_heads*2*head_dim]
+    device const uint16_t* q_norm_w   [[buffer(1)]],  // [head_dim] bf16
+    device float*          out_q      [[buffer(2)]],  // [num_q_heads*head_dim]
+    device float*          out_q_gate [[buffer(3)]],  // [num_q_heads*head_dim]
+    constant uint&         head_dim   [[buffer(4)]],
+    constant uint&         rotary_dim [[buffer(5)]],
+    constant int&          pos        [[buffer(6)]],
+    constant float&        rope_theta [[buffer(7)]],
+    constant float&        rms_eps    [[buffer(8)]],
+    uint head_id     [[threadgroup_position_in_grid]],
+    uint tid         [[thread_position_in_threadgroup]]
+) {
+    threadgroup float shared_sum[16];  // max 512 threads / 32 = 16 simds
+
+    device const float* q_src = q_proj_out + head_id * 2 * head_dim;
+    float qv = q_src[tid];
+    float gv = q_src[head_dim + tid];
+
+    // Sum of squares for RMS norm.
+    float sqv = qv * qv;
+    float simd_v = simd_sum(sqv);
+    uint simd_lane  = tid % 32;
+    uint simd_group = tid / 32;
+    if (simd_lane == 0) shared_sum[simd_group] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float tot = 0.0f;
+    if (simd_group == 0) {
+        uint num_simds = (head_dim + 31) / 32;
+        tot = (simd_lane < num_simds) ? shared_sum[simd_lane] : 0.0f;
+        tot = simd_sum(tot);
+        if (simd_lane == 0) shared_sum[0] = tot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tot = shared_sum[0];
+
+    float inv_rms = rsqrt(tot / float(head_dim) + rms_eps);
+    float qw = bf16_to_f32(q_norm_w[tid]);
+    float q_normed = qv * inv_rms * qw;
+
+    // Partial RoPE. For tid < rotary_dim, rotate with paired element.
+    uint half_rot = rotary_dim / 2;
+    float q_out_val = q_normed;
+    if (tid < half_rot) {
+        uint j = tid + half_rot;
+        float qh = q_src[j];
+        float qh_w = bf16_to_f32(q_norm_w[j]);
+        float qh_n = qh * inv_rms * qh_w;
+        float freq = 1.0f / pow(rope_theta, float(2 * tid) / float(rotary_dim));
+        float angle = float(pos) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        q_out_val = q_normed * c - qh_n * s;
+    } else if (tid < rotary_dim) {
+        uint i = tid - half_rot;
+        float qlo = q_src[i];
+        float qlo_w = bf16_to_f32(q_norm_w[i]);
+        float qlo_n = qlo * inv_rms * qlo_w;
+        float freq = 1.0f / pow(rope_theta, float(2 * i) / float(rotary_dim));
+        float angle = float(pos) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        q_out_val = qlo_n * s + q_normed * c;
+    }
+
+    out_q[head_id * head_dim + tid] = q_out_val;
+    out_q_gate[head_id * head_dim + tid] = gv;
+}
+
+kernel void k_norm_rope(
+    device const float*    k_out      [[buffer(0)]],  // [num_kv_heads*head_dim]
+    device const uint16_t* k_norm_w   [[buffer(1)]],  // [head_dim] bf16
+    device float*          out_k      [[buffer(2)]],  // [num_kv_heads*head_dim]
+    constant uint&         head_dim   [[buffer(3)]],
+    constant uint&         rotary_dim [[buffer(4)]],
+    constant int&          pos        [[buffer(5)]],
+    constant float&        rope_theta [[buffer(6)]],
+    constant float&        rms_eps    [[buffer(7)]],
+    uint head_id     [[threadgroup_position_in_grid]],
+    uint tid         [[thread_position_in_threadgroup]]
+) {
+    threadgroup float shared_sum[16];
+
+    device const float* k_src = k_out + head_id * head_dim;
+    float kv = k_src[tid];
+
+    float skv = kv * kv;
+    float simd_v = simd_sum(skv);
+    uint simd_lane  = tid % 32;
+    uint simd_group = tid / 32;
+    if (simd_lane == 0) shared_sum[simd_group] = simd_v;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float tot = 0.0f;
+    if (simd_group == 0) {
+        uint num_simds = (head_dim + 31) / 32;
+        tot = (simd_lane < num_simds) ? shared_sum[simd_lane] : 0.0f;
+        tot = simd_sum(tot);
+        if (simd_lane == 0) shared_sum[0] = tot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tot = shared_sum[0];
+
+    float inv_rms = rsqrt(tot / float(head_dim) + rms_eps);
+    float kw = bf16_to_f32(k_norm_w[tid]);
+    float k_normed = kv * inv_rms * kw;
+
+    uint half_rot = rotary_dim / 2;
+    float k_out_val = k_normed;
+    if (tid < half_rot) {
+        uint j = tid + half_rot;
+        float kh = k_src[j];
+        float kh_w = bf16_to_f32(k_norm_w[j]);
+        float kh_n = kh * inv_rms * kh_w;
+        float freq = 1.0f / pow(rope_theta, float(2 * tid) / float(rotary_dim));
+        float angle = float(pos) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        k_out_val = k_normed * c - kh_n * s;
+    } else if (tid < rotary_dim) {
+        uint i = tid - half_rot;
+        float klo = k_src[i];
+        float klo_w = bf16_to_f32(k_norm_w[i]);
+        float klo_n = klo * inv_rms * klo_w;
+        float freq = 1.0f / pow(rope_theta, float(2 * i) / float(rotary_dim));
+        float angle = float(pos) * freq;
+        float c = cos(angle);
+        float s = sin(angle);
+        k_out_val = klo_n * s + k_normed * c;
+    }
+
+    out_k[head_id * head_dim + tid] = k_out_val;
+}
+
+
 kernel void residual_add(
     device const float* a   [[buffer(0)]],
     device const float* b   [[buffer(1)]],
@@ -1424,6 +2273,66 @@ kernel void residual_add(
 ) {
     if (tid >= dim) return;
     out[tid] = a[tid] + b[tid];
+}
+
+
+// ============================================================================
+// Kernel 5b: Fused residual_add + rms_norm_apply (bf16 weight)
+// ============================================================================
+// Single-dispatch fusion of three previously-separate encoders:
+//   1. residual_add:        h_mid   = a + b
+//   2. rms_norm_sum_sq:     sum_sq  = sum(h_mid^2)
+//   3. rms_norm_apply_bf16: out     = h_mid / sqrt(mean_sq + eps) * w
+//
+// Saves two dispatch launches per site (~50-70 µs per layer). Also writes
+// h_mid out so downstream kernels can still read the unnormalized residual.
+//
+// Dispatch: 1 threadgroup with 256 threads. dim must be ≤ 4096 (fits the
+// thread loop; hidden_dim is always 4096 for Qwen3.5 variants).
+
+kernel void residual_rms_norm_fused(
+    device const float*    a         [[buffer(0)]],  // residual input (stays; dim)
+    device const float*    b         [[buffer(1)]],  // other input    (stays; dim)
+    device float*          h_mid     [[buffer(2)]],  // output: h_mid = a + b   (dim)
+    device const uint16_t* weight    [[buffer(3)]],  // bf16 rms weight         (dim)
+    device float*          out       [[buffer(4)]],  // output: normed          (dim)
+    constant uint&         dim       [[buffer(5)]],
+    constant float&        eps       [[buffer(6)]],
+    uint lid         [[thread_position_in_threadgroup]],
+    uint simd_lane   [[thread_index_in_simdgroup]],
+    uint simd_group  [[simdgroup_index_in_threadgroup]]
+) {
+    threadgroup float shared[32];
+
+    // Phase 1: compute h_mid = a + b, accumulate sum of squares.
+    float acc = 0.0f;
+    for (uint i = lid; i < dim; i += 256) {
+        float v = a[i] + b[i];
+        h_mid[i] = v;
+        acc = fma(v, v, acc);
+    }
+
+    // Reduce sum of squares across the threadgroup.
+    float simd_val = simd_sum(acc);
+    if (simd_lane == 0) shared[simd_group] = simd_val;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float tot = 0.0f;
+    if (simd_group == 0) {
+        tot = (simd_lane < 8) ? shared[simd_lane] : 0.0f;
+        tot = simd_sum(tot);
+        if (simd_lane == 0) shared[0] = tot;
+    }
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    tot = shared[0];
+
+    float rms = rsqrt(tot / float(dim) + eps);
+
+    // Phase 2: write out[i] = h_mid[i] * rms * weight[i].
+    for (uint i = lid; i < dim; i += 256) {
+        float w = bf16_to_f32(weight[i]);
+        out[i] = h_mid[i] * rms * w;
+    }
 }
 
 

@@ -111,6 +111,10 @@ typedef struct {
     double expert_io;        // parallel pread + cache lookup
     double cmd3_encode;      // CMD3 encode experts + submit (deferred)
     double total;            // total per-layer time
+    // Actual GPU execution times from MTLCommandBuffer.GPU{Start,End}Time,
+    // populated via completedHandler (async, may update after CPU timing prints).
+    double cmd1_gpu;         // CMD1 GPU time
+    double cmd_fused_gpu;    // CMD2+CMD3 fused GPU time (dense path)
     int count;               // number of layers timed
 } LayerTimingAccum;
 
@@ -316,6 +320,8 @@ static void timing_print(void) {
     fprintf(stderr, "  expert_io:      %6.3f\n", g_timing.expert_io / n);
     fprintf(stderr, "  cmd3_encode:    %6.3f\n", g_timing.cmd3_encode / n);
     fprintf(stderr, "  total_layer:    %6.3f\n", g_timing.total / n);
+    fprintf(stderr, "  cmd1_gpu:       %6.3f (real GPU time)\n", g_timing.cmd1_gpu / n);
+    fprintf(stderr, "  cmd_fused_gpu:  %6.3f (real GPU time for CMD2+CMD3 fused)\n", g_timing.cmd_fused_gpu / n);
     fprintf(stderr, "  sum_phases:     %6.3f\n",
             (g_timing.deferred_wait + g_timing.deferred_cpu + g_timing.input_norm +
              g_timing.cmd1_submit + g_timing.cmd1_wait + g_timing.spec_route +
@@ -1092,24 +1098,33 @@ typedef struct {
     id<MTLComputePipelineState> matvec_v5;  // LUT dequant variant
     id<MTLComputePipelineState> matvec_fast;  // for in_dim > 4096
     id<MTLComputePipelineState> matvec_2bit;  // 2-bit expert dequant kernel
-    id<MTLComputePipelineState> matvec_8bit;  // 8-bit expert dequant kernel
-    id<MTLComputePipelineState> matvec_8bit_fast; // 8-bit for in_dim > 4096
+    id<MTLComputePipelineState> matvec_8bit;            // 8-bit expert dequant kernel (legacy single-row)
+    id<MTLComputePipelineState> matvec_8bit_opt;        // 8-bit multi-row SIMD (4 rows/SIMD, 32 rows/TG) small in_dim
+    id<MTLComputePipelineState> matvec_8bit_fast;       // 8-bit for in_dim > 4096 (legacy)
+    id<MTLComputePipelineState> matvec_8bit_fast_opt;   // 8-bit multi-row SIMD for large in_dim
+    id<MTLComputePipelineState> matvec_8bit_fast_swiglu_down;  // fused swiglu + Q8 down_proj
+    id<MTLComputePipelineState> matvec_8bit_gate_up;  // fused Q8 gate_proj + up_proj
     id<MTLComputePipelineState> matvec_6bit;      // 6-bit dequant kernel
     id<MTLComputePipelineState> matvec_6bit_fast; // 6-bit for in_dim > 4096
     id<MTLComputePipelineState> matvec_5bit;      // 5-bit dequant kernel
     id<MTLComputePipelineState> matvec_5bit_fast; // 5-bit for in_dim > 4096
-    id<MTLComputePipelineState> matvec_bf16;      // BF16 unquantized matvec
+    id<MTLComputePipelineState> matvec_bf16;      // BF16 unquantized matvec (legacy single-row)
+    id<MTLComputePipelineState> matvec_bf16_opt;  // BF16 multi-row SIMD
     id<MTLComputePipelineState> matvec_bf16_fast; // BF16 for in_dim > 8192
+    id<MTLComputePipelineState> matvec_bf16_pair; // fused 2-matrix BF16 (for tiny b/a projections)
     id<MTLComputePipelineState> rms_norm_sum;
     id<MTLComputePipelineState> rms_norm_apply;
     id<MTLComputePipelineState> rms_norm_apply_bf16;
     id<MTLComputePipelineState> residual_add;
+    id<MTLComputePipelineState> residual_rms_norm_fused;  // fused add + rms norm (bf16 w)
     id<MTLComputePipelineState> swiglu;
     // GPU attention pipelines
     id<MTLComputePipelineState> attn_scores_pipe;
     id<MTLComputePipelineState> attn_softmax_pipe;
     id<MTLComputePipelineState> attn_values_pipe;
     id<MTLComputePipelineState> sigmoid_gate_pipe;
+    id<MTLComputePipelineState> q_norm_rope_pipe;
+    id<MTLComputePipelineState> k_norm_rope_pipe;
     // Reusable buffers for attention matmuls
     id<MTLBuffer> buf_input;     // input vector [HIDDEN_DIM or max projection input]
     id<MTLBuffer> buf_output;    // output vector [max projection output]
@@ -1241,23 +1256,32 @@ static MetalCtx *metal_setup(void) {
     ctx->matvec_v5     = makePipe(@"dequant_matvec_4bit_v5");  // LUT variant (no uint→float conversions)
     ctx->matvec_fast   = makePipe(@"dequant_matvec_4bit_fast");
     ctx->matvec_2bit   = makePipe(@"dequant_matvec_2bit");
-    ctx->matvec_8bit      = makePipe(@"dequant_matvec_8bit");
-    ctx->matvec_8bit_fast = makePipe(@"dequant_matvec_8bit_fast");
+    ctx->matvec_8bit          = makePipe(@"dequant_matvec_8bit");
+    ctx->matvec_8bit_opt      = makePipe(@"dequant_matvec_8bit_opt");
+    ctx->matvec_8bit_fast     = makePipe(@"dequant_matvec_8bit_fast");
+    ctx->matvec_8bit_fast_opt = makePipe(@"dequant_matvec_8bit_fast_opt");
+    ctx->matvec_8bit_fast_swiglu_down = makePipe(@"dequant_matvec_8bit_fast_swiglu_down");
+    ctx->matvec_8bit_gate_up          = makePipe(@"dequant_matvec_8bit_gate_up");
     ctx->matvec_6bit      = makePipe(@"dequant_matvec_6bit");
     ctx->matvec_6bit_fast = makePipe(@"dequant_matvec_6bit_fast");
     ctx->matvec_5bit      = makePipe(@"dequant_matvec_5bit");
     ctx->matvec_5bit_fast = makePipe(@"dequant_matvec_5bit_fast");
     ctx->matvec_bf16      = makePipe(@"bf16_matvec");
+    ctx->matvec_bf16_opt  = makePipe(@"bf16_matvec_opt");
     ctx->matvec_bf16_fast = makePipe(@"bf16_matvec_fast");
+    ctx->matvec_bf16_pair = makePipe(@"bf16_matvec_pair");
     ctx->rms_norm_sum  = makePipe(@"rms_norm_sum_sq");
     ctx->rms_norm_apply = makePipe(@"rms_norm_apply");
     ctx->rms_norm_apply_bf16 = makePipe(@"rms_norm_apply_bf16");
     ctx->residual_add  = makePipe(@"residual_add");
+    ctx->residual_rms_norm_fused = makePipe(@"residual_rms_norm_fused");
     ctx->swiglu        = makePipe(@"swiglu_fused");
     ctx->attn_scores_pipe  = makePipe(@"attn_scores_batched");
     ctx->attn_softmax_pipe = makePipe(@"attn_softmax_batched");
     ctx->attn_values_pipe  = makePipe(@"attn_values_batched");
     ctx->sigmoid_gate_pipe = makePipe(@"sigmoid_gate");
+    ctx->q_norm_rope_pipe  = makePipe(@"q_norm_rope");
+    ctx->k_norm_rope_pipe  = makePipe(@"k_norm_rope");
     ctx->moe_combine_residual = makePipe(@"moe_combine_residual");
     ctx->delta_net_step    = makePipe(@"gated_delta_net_step");
     ctx->conv1d_step       = makePipe(@"conv1d_step");
@@ -1462,10 +1486,31 @@ static inline id<MTLComputePipelineState> select_dequant_pipe(MetalCtx *ctx, int
         case 2:  return ctx->matvec_2bit;
         case 5:  return use_small ? ctx->matvec_5bit : ctx->matvec_5bit_fast;
         case 6:  return use_small ? ctx->matvec_6bit : ctx->matvec_6bit_fast;
-        case 8:  return use_small ? ctx->matvec_8bit : ctx->matvec_8bit_fast;
-        case 16: return (in_dim <= 8192) ? ctx->matvec_bf16 : ctx->matvec_bf16_fast;
+        case 8:  return use_small ? ctx->matvec_8bit_opt : ctx->matvec_8bit_fast_opt;
+        case 16: return (in_dim <= 4096) ? ctx->matvec_bf16_opt : ctx->matvec_bf16_fast;
         default: return use_small ? ctx->matvec_v3   : ctx->matvec_fast;  // 4-bit
     }
+}
+
+// Rows-per-TG for the pipeline select_dequant_pipe returned. Determines the
+// threadgroup dispatch count for the "small" (shared-mem cache) kernels.
+static inline int dequant_rows_per_tg(MetalCtx *ctx, id<MTLComputePipelineState> pipe) {
+    if (pipe == ctx->matvec_8bit_opt) return 32;      // 4 rows/SIMD × 8 SIMDs/TG
+    if (pipe == ctx->matvec_8bit_fast_opt) return 32;
+    if (pipe == ctx->matvec_bf16_opt) return 32;
+    return 8;                                          // all other small kernels
+}
+
+static inline int dequant_threads_per_tg(MetalCtx *ctx, id<MTLComputePipelineState> pipe) {
+    return 256;  // all _opt kernels use 8 SIMDs × 32 lanes
+}
+
+// Is this pipeline one of the multi-row "_opt" variants? The _opt kernels use
+// 256 threads per TG regardless of use_small; the legacy _fast kernels use 64.
+static inline int dequant_is_opt_pipe(MetalCtx *ctx, id<MTLComputePipelineState> pipe) {
+    return (pipe == ctx->matvec_8bit_opt) ||
+           (pipe == ctx->matvec_8bit_fast_opt) ||
+           (pipe == ctx->matvec_bf16_opt);
 }
 
 // Select the correct dequant pipeline based on active quantization (expert path)
@@ -1568,13 +1613,13 @@ static void gpu_dequant_matvec_ex(
         [enc setBytes:&group_size   length:4     atIndex:7];
     }
 
-    if (use_small) {
-        // v3: tiled threadgroups, 256 threads, 8 rows per TG
-        uint32_t num_tgs = (out_dim + 7) / 8;
+    if (use_small || dequant_is_opt_pipe(ctx, pipe)) {
+        uint32_t rpt = (uint32_t)dequant_rows_per_tg(ctx, pipe);
+        uint32_t tpt = (uint32_t)dequant_threads_per_tg(ctx, pipe);
+        uint32_t num_tgs = (out_dim + rpt - 1) / rpt;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
     } else {
-        // fast: one threadgroup per output row, 64 threads per TG
         NSUInteger tg_size = 64;
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(tg_size, 1, 1)];
@@ -1699,10 +1744,12 @@ static void gpu_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_small) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (use_small || dequant_is_opt_pipe(ctx, mv_pipe)) {
+            uint32_t rpt = (uint32_t)dequant_rows_per_tg(ctx, mv_pipe);
+            uint32_t tpt = (uint32_t)dequant_threads_per_tg(ctx, mv_pipe);
+            uint32_t num_tgs = (s->out_dim + rpt - 1) / rpt;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -1755,10 +1802,12 @@ static void gpu_encode_batch_matvec(
         [enc setBytes:&s->in_dim    length:4     atIndex:6];
         [enc setBytes:&s->group_size length:4    atIndex:7];
 
-        if (use_small) {
-            uint32_t num_tgs = (s->out_dim + 7) / 8;
+        if (use_small || dequant_is_opt_pipe(ctx, mv_pipe)) {
+            uint32_t rpt = (uint32_t)dequant_rows_per_tg(ctx, mv_pipe);
+            uint32_t tpt = (uint32_t)dequant_threads_per_tg(ctx, mv_pipe);
+            uint32_t num_tgs = (s->out_dim + rpt - 1) / rpt;
             [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
         } else {
             [enc dispatchThreadgroups:MTLSizeMake(s->out_dim, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -1806,10 +1855,12 @@ static void gpu_encode_dequant_matvec_with_io_bufs(
     [enc setBytes:&group_size  length:4     atIndex:7];
 
     int use_small = (in_dim <= 4096);
-    if (use_small) {
-        uint32_t num_tgs = (out_dim + 7) / 8;
+    if (use_small || dequant_is_opt_pipe(ctx, pipe)) {
+        uint32_t rpt = (uint32_t)dequant_rows_per_tg(ctx, pipe);
+        uint32_t tpt = (uint32_t)dequant_threads_per_tg(ctx, pipe);
+        uint32_t num_tgs = (out_dim + rpt - 1) / rpt;
         [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-            threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
     } else {
         [enc dispatchThreadgroups:MTLSizeMake(out_dim, 1, 1)
             threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -4665,6 +4716,8 @@ static void fused_layer_forward(
     // We can submit CMD1 immediately — the GPU queue serializes CMD3(N-1) then CMD1(N).
     int prev_gpu_combined = (g_deferred.active && g_deferred.gpu_combined);
 
+    int full_attn_gpu_done = 0;  // set if CMD1 GPU dispatched q/k norm+rope
+
     if (prev_gpu_combined && g_metal && g_metal->wf_buf && num_attn_specs > 0) {
         // ---- FAST PATH: GPU-combined previous CMD3 ----
         // buf_input already has the normalized hidden state from CMD3(N-1).
@@ -4672,10 +4725,38 @@ static void fused_layer_forward(
         if (g_timing_enabled) { t0 = now_ms(); }
 
         cmd1 = [g_metal->queue commandBuffer];
+
+        // Encode the tiny BF16 b/a pair matvec FIRST so Metal's scheduler can
+        // overlap it with the Q8 batch matvec that follows (both read buf_input,
+        // write different batch_out slots — no dependency). For the Qwen3.5-9B
+        // linear-attn layers, b/a are [32, 4096] bf16.
+        int have_bf16_ba = !is_full && lc->b_w && !lc->b_s && lc->a_w && !lc->a_s;
+        if (have_bf16_ba && g_metal->matvec_bf16_pair) {
+            uint32_t ba_out = LINEAR_NUM_V_HEADS;  // 32 for 9B
+            uint32_t ba_in  = HIDDEN_DIM;
+            NSUInteger b_off = (NSUInteger)((const char *)lc->b_w - (const char *)[g_metal->wf_buf contents]);
+            NSUInteger a_off = (NSUInteger)((const char *)lc->a_w - (const char *)[g_metal->wf_buf contents]);
+            // Single fused dispatch: outputs b→batch_out[2], a→batch_out[3].
+            id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+            [enc setComputePipelineState:g_metal->matvec_bf16_pair];
+            [enc setBuffer:g_metal->wf_buf       offset:b_off atIndex:0];  // W_a slot → beta weights
+            [enc setBuffer:g_metal->wf_buf       offset:a_off atIndex:1];  // W_b slot → alpha weights
+            [enc setBuffer:g_metal->buf_input    offset:0     atIndex:2];
+            [enc setBuffer:g_metal->batch_out[2] offset:0     atIndex:3];
+            [enc setBuffer:g_metal->batch_out[3] offset:0     atIndex:4];
+            [enc setBytes:&ba_out length:4 atIndex:5];
+            [enc setBytes:&ba_in  length:4 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(ba_out, 1, 1)
+                threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
+            [enc endEncoding];
+        }
+
+        // Q8 batch matvec for the Q8 projections (qkv, z, optionally b/a if Q8).
         gpu_encode_batch_matvec(g_metal, cmd1, attn_specs, num_attn_specs);
 
         // GPU linear attention: encode conv1d + normalize + decay/beta + delta-net + gated_norm into CMD1
-        if (can_gpu_linear && num_attn_specs == 4) {
+        int ba_ready = (num_attn_specs >= 4) || have_bf16_ba;
+        if (can_gpu_linear && ba_ready) {
             // batch_out[0]=qkv(12288), [1]=z(8192), [2]=beta(64), [3]=alpha(64)
             uint32_t conv_dim = LINEAR_CONV_DIM;
             NSUInteger conv_w_off = (NSUInteger)((const char *)lc->conv1d_w - (const char *)[g_metal->wf_buf contents]);
@@ -4766,15 +4847,105 @@ static void fused_layer_forward(
             gpu_linear_attn = 1;
         }
 
+        // ---- Full-attention GPU pre-processing (dense model) ----
+        // For full-attn dense layers with GPU attention: append q_norm + RoPE
+        // and k_norm + RoPE encoders to CMD1 so the CPU can skip all of the
+        // Q/K split/norm/rope work. batch_out[0]=q_proj, [1]=k_proj, [2]=v_proj.
+        // Writes go to buf_attn_q, buf_attn_gate, buf_kv_k[fa_idx] (position slot).
+        int fa_idx_fast = is_full ? ((layer_idx + 1) / FULL_ATTN_INTERVAL - 1) : -1;
+        int do_full_attn_gpu = (is_full && IS_DENSE && num_attn_specs == 3 &&
+                                 g_metal->q_norm_rope_pipe && g_metal->k_norm_rope_pipe &&
+                                 lc->q_norm_w && lc->k_norm_w &&
+                                 fa_idx_fast >= 0 && fa_idx_fast < NUM_FULL_ATTN_LAYERS &&
+                                 kv && kv->len < GPU_KV_SEQ);
+        if (do_full_attn_gpu) {
+            NSUInteger qnorm_off = (NSUInteger)((const char *)lc->q_norm_w - (const char *)[g_metal->wf_buf contents]);
+            NSUInteger knorm_off = (NSUInteger)((const char *)lc->k_norm_w - (const char *)[g_metal->wf_buf contents]);
+            uint32_t hd = HEAD_DIM;
+            uint32_t rd = ROTARY_DIM;
+            int     p  = kv->len;
+            float   rt = ROPE_THETA;
+            float   eps = RMS_NORM_EPS;
+
+            // q_norm_rope: reads batch_out[0] (q_proj), writes buf_attn_q + buf_attn_gate
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->q_norm_rope_pipe];
+                [enc setBuffer:g_metal->batch_out[0]  offset:0          atIndex:0];
+                [enc setBuffer:g_metal->wf_buf        offset:qnorm_off  atIndex:1];
+                [enc setBuffer:g_metal->buf_attn_q    offset:0          atIndex:2];
+                [enc setBuffer:g_metal->buf_attn_gate offset:0          atIndex:3];
+                [enc setBytes:&hd  length:4 atIndex:4];
+                [enc setBytes:&rd  length:4 atIndex:5];
+                [enc setBytes:&p   length:4 atIndex:6];
+                [enc setBytes:&rt  length:4 atIndex:7];
+                [enc setBytes:&eps length:4 atIndex:8];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_ATTN_HEADS, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+                [enc endEncoding];
+            }
+            // k_norm_rope: reads batch_out[1] (k_proj), writes into buf_kv_k[fa_idx] at position p
+            {
+                int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+                NSUInteger k_off = (NSUInteger)p * kv_dim * sizeof(float);
+                id<MTLComputeCommandEncoder> enc = [cmd1 computeCommandEncoder];
+                [enc setComputePipelineState:g_metal->k_norm_rope_pipe];
+                [enc setBuffer:g_metal->batch_out[1]           offset:0          atIndex:0];
+                [enc setBuffer:g_metal->wf_buf                 offset:knorm_off  atIndex:1];
+                [enc setBuffer:g_metal->buf_kv_k[fa_idx_fast]  offset:k_off      atIndex:2];
+                [enc setBytes:&hd  length:4 atIndex:3];
+                [enc setBytes:&rd  length:4 atIndex:4];
+                [enc setBytes:&p   length:4 atIndex:5];
+                [enc setBytes:&rt  length:4 atIndex:6];
+                [enc setBytes:&eps length:4 atIndex:7];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_KV_HEADS, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+                [enc endEncoding];
+            }
+            // V copy: write batch_out[2] (v_proj) into buf_kv_v[fa_idx_fast] at position p.
+            // V has no norm/rope, just a blit.
+            {
+                int kv_dim = NUM_KV_HEADS * HEAD_DIM;
+                id<MTLBlitCommandEncoder> blit = [cmd1 blitCommandEncoder];
+                [blit copyFromBuffer:g_metal->batch_out[2]
+                        sourceOffset:0
+                            toBuffer:g_metal->buf_kv_v[fa_idx_fast]
+                    destinationOffset:(NSUInteger)p * kv_dim * sizeof(float)
+                                 size:kv_dim * sizeof(float)];
+                [blit endEncoding];
+            }
+            full_attn_gpu_done = 1;
+        }
+
+        if (g_timing_enabled) {
+            [cmd1 addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+                __sync_fetch_and_add((long *)&g_timing.count, 0);  // mem barrier
+                g_timing.cmd1_gpu += gpu_ms;
+            }];
+        }
         [cmd1 commit];
 
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_submit += t1 - t0; }
 
-        // Wait for CMD1 (implies CMD3(N-1) also done, since queue is serial)
+        // Wait for CMD1's results IF the CPU needs them: either because we
+        // need to gpu_flush_batch_results (CPU attention for full-attn layers
+        // without GPU linear-attn) or to read buf_moe_hidden via finalize
+        // (any deferred state). For pure GPU-linear-attn layers in the dense
+        // fast-path, we only need CMD_fused(N-1) done — CMD1(N) can still be
+        // running while we encode CMD_fused(N).
         if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd1 waitUntilCompleted];
-        if (!gpu_linear_attn) {
+        int cmd1_needed_by_cpu = !gpu_linear_attn && !full_attn_gpu_done;
+        if (cmd1_needed_by_cpu) {
+            [cmd1 waitUntilCompleted];
             gpu_flush_batch_results(g_metal, attn_specs, num_attn_specs);
+        } else {
+            // For GPU-linear-attn layers, CMD1 output stays on GPU (batch_out[6]).
+            // We still need the *previous* layer's CMD_fused to be done before
+            // reading buf_moe_hidden in finalize. On the serial queue, CMD_fused(N-1)
+            // completes before CMD1(N) starts, so waiting on g_deferred.cmd_experts
+            // is sufficient (and often shorter than waiting on CMD1).
+            wait_deferred_experts_gpu();
         }
         if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd1_wait += t1 - t0; }
 
@@ -5087,7 +5258,12 @@ static void fused_layer_forward(
     // ---- CPU attention compute (produces attn_out for o_proj) ----
     float *attn_out_for_oproj = NULL;
 
-    if (is_full) {
+    if (is_full && full_attn_gpu_done) {
+        // GPU already did Q split + Q/K norm + RoPE + KV cache update in CMD1.
+        // CPU only needs to bump kv->len and signal CMD_fused to use GPU attention.
+        kv->len++;
+        attn_out_for_oproj = NULL;  // signals CMD_fused to use GPU buf_attn_out
+    } else if (is_full) {
         // ---- Full attention CPU compute ----
         int q_proj_dim = NUM_ATTN_HEADS * HEAD_DIM * 2;
         int q_dim = NUM_ATTN_HEADS * HEAD_DIM;
@@ -5151,7 +5327,7 @@ static void fused_layer_forward(
         // Only enabled when seq_len >= 32 (below that, CPU is faster).
         int gpu_attn_ready = (g_metal && g_metal->attn_scores_pipe &&
                               fa_idx >= 0 && fa_idx < NUM_FULL_ATTN_LAYERS &&
-                              kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                              kv->len >= 1 && kv->len < GPU_KV_SEQ);
 
         if (gpu_attn_ready) {
             // Copy Q and gate to GPU; attention dispatches will be in CMD2
@@ -5437,7 +5613,7 @@ static void fused_layer_forward(
     // Only enabled when seq_len >= 32 — below that, CPU attention is faster
     // because GPU command encoder overhead dominates at short sequences.
     int gpu_attn_fuse = (is_full && !attn_out_for_oproj && g_metal && g_metal->attn_scores_pipe
-                         && kv && kv->len >= 32 && kv->len < GPU_KV_SEQ);
+                         && kv && kv->len >= 1 && kv->len < GPU_KV_SEQ);
 
     if ((attn_out_for_oproj || gpu_attn_fuse) && oproj_w &&
         (oproj_s || lc->out_proj_bits == 16) &&  // Allow bf16 unquantized o_proj
@@ -5584,9 +5760,11 @@ static void fused_layer_forward(
             }
             int o_use_small = (oproj_bits == 16) ? (oproj_in_dim <= 8192) : (oproj_in_dim <= 4096);
             if (o_use_small) {
-                uint32_t num_tgs = (o_out_dim + 7) / 8;
+                uint32_t rpt = (uint32_t)dequant_rows_per_tg(g_metal, oproj_pipe);
+                uint32_t tpt = (uint32_t)dequant_threads_per_tg(g_metal, oproj_pipe);
+                uint32_t num_tgs = (o_out_dim + rpt - 1) / rpt;
                 [enc dispatchThreadgroups:MTLSizeMake(num_tgs, 1, 1)
-                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                    threadsPerThreadgroup:MTLSizeMake(tpt, 1, 1)];
             } else {
                 [enc dispatchThreadgroups:MTLSizeMake(o_out_dim, 1, 1)
                     threadsPerThreadgroup:MTLSizeMake(64, 1, 1)];
@@ -5594,59 +5772,78 @@ static void fused_layer_forward(
             [enc endEncoding];
         }
 
-        // ---- Enc 2: residual_add (buf_output + buf_residual -> buf_h_mid) ----
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-            uint32_t dim = HIDDEN_DIM;
-            [enc setComputePipelineState:g_metal->residual_add];
-            [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];  // a = residual
-            [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];  // b = o_proj result
-            [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];  // out = h_mid
-            [enc setBytes:&dim length:4 atIndex:3];
-            uint32_t tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // ---- Enc 3: rms_norm_sum_sq (buf_h_mid -> buf_sum_sq) ----
-        {
-            id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
-            uint32_t dim = HIDDEN_DIM;
-            [enc setComputePipelineState:g_metal->rms_norm_sum];
-            [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
-            [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
-            [enc setBytes:&dim length:4 atIndex:2];
-            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-            [enc endEncoding];
-        }
-
-        // ---- Enc 4: rms_norm_apply_bf16 (buf_h_mid + norm_w -> buf_input) ----
-        {
+        // ---- Fused: residual_add + rms_norm_sum_sq + rms_norm_apply_bf16 ----
+        //   buf_h_mid = buf_residual + buf_output
+        //   buf_input = rms_norm(buf_h_mid) * post_attn_norm_w
+        // Single dispatch replaces the previous 3-encoder sequence.
+        if (g_metal->residual_rms_norm_fused) {
             NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
                                                (const char *)[g_metal->wf_buf contents]);
             id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
             uint32_t dim = HIDDEN_DIM;
             float eps = RMS_NORM_EPS;
-            [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
-            [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];  // x
-            [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1]; // weight (bf16)
-            [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];  // sum_sq
-            [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];  // out = h_post
-            [enc setBytes:&dim length:4 atIndex:4];
-            [enc setBytes:&eps length:4 atIndex:5];
-            uint32_t tgs = (dim + 255) / 256;
-            [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+            [enc setComputePipelineState:g_metal->residual_rms_norm_fused];
+            [enc setBuffer:g_metal->buf_residual offset:0       atIndex:0];  // a
+            [enc setBuffer:g_metal->buf_output   offset:0       atIndex:1];  // b
+            [enc setBuffer:g_metal->buf_h_mid    offset:0       atIndex:2];  // h_mid out
+            [enc setBuffer:g_metal->wf_buf       offset:norm_off atIndex:3]; // bf16 weight
+            [enc setBuffer:g_metal->buf_input    offset:0       atIndex:4];  // normed out (h_post)
+            [enc setBytes:&dim length:4 atIndex:5];
+            [enc setBytes:&eps length:4 atIndex:6];
+            [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
             [enc endEncoding];
+        } else {
+            // Fallback to 3 separate encoders.
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:g_metal->residual_add];
+                [enc setBuffer:g_metal->buf_residual offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_output   offset:0 atIndex:1];
+                [enc setBuffer:g_metal->buf_h_mid    offset:0 atIndex:2];
+                [enc setBytes:&dim length:4 atIndex:3];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            {
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                [enc setComputePipelineState:g_metal->rms_norm_sum];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0 atIndex:0];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0 atIndex:1];
+                [enc setBytes:&dim length:4 atIndex:2];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
+            {
+                NSUInteger norm_off = (NSUInteger)((const char *)lc->post_attn_norm_w -
+                                                   (const char *)[g_metal->wf_buf contents]);
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                float eps = RMS_NORM_EPS;
+                [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
+                [enc setBuffer:g_metal->buf_h_mid  offset:0       atIndex:0];
+                [enc setBuffer:g_metal->wf_buf     offset:norm_off atIndex:1];
+                [enc setBuffer:g_metal->buf_sum_sq offset:0       atIndex:2];
+                [enc setBuffer:g_metal->buf_input  offset:0       atIndex:3];
+                [enc setBytes:&dim length:4 atIndex:4];
+                [enc setBytes:&eps length:4 atIndex:5];
+                uint32_t tgs = (dim + 255) / 256;
+                [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            }
         }
 
         // ---- Enc 5+: MLP input projections (read buf_input = h_post) ----
         if (is_dense) {
-            // Dense path: gate_proj + up_proj write directly into buf_shared_gate /
-            // buf_shared_up (resized to fit INTERMEDIATE_SIZE). No router, no
-            // shared_expert_gate, no batch_out roundtrip.
+            // Dense path: gate_proj + up_proj as separate dispatches. Fusing
+            // them into one kernel was measurably slower (register pressure
+            // reduced TG occupancy), so we keep them split.
             gpu_encode_dequant_matvec_with_io_bufs(
                 g_metal, cmd_fused, sgw, sgs, sgb,
                 g_metal->buf_input, g_metal->buf_shared_gate,
@@ -5668,27 +5865,19 @@ static void fused_layer_forward(
             gpu_encode_batch_matvec(g_metal, cmd_fused, moe_specs, 4);
         }
 
-        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
-
-        // ---- Single commit+wait for all encoders ----
-        if (g_timing_enabled) { t0 = now_ms(); }
-        [cmd_fused commit];
-        [cmd_fused waitUntilCompleted];
-        if (cmd_fused.error) {
-            fprintf(stderr, "[L%d] CMD2 ERROR: %s\n", layer_idx,
-                    [[cmd_fused.error description] UTF8String]);
-        }
-
         if (is_dense) {
-            // Dense: skip CPU routing, expert I/O, and CPU final combine entirely.
-            // Encode CMD3 = SwiGLU + down_proj + residual_add (+ next-layer norm if
-            // not the final layer). Defer commit so the next layer's CMD1 can submit
-            // immediately on the GPU's serial queue.
-            id<MTLCommandBuffer> cmd_dense = [g_metal->queue commandBuffer];
+            // Dense fast path: append the MLP tail (SwiGLU + down_proj +
+            // residual + optional next-layer norm) to the SAME command buffer
+            // as o_proj/norm/gate/up, then commit once (async). This removes
+            // the CMD2 wait and the CMD3 commit overhead entirely — a single
+            // deferred command buffer per layer.
 
-            // SwiGLU: buf_shared_gate, buf_shared_up -> buf_shared_act (length INTERMEDIATE_SIZE)
+            // SwiGLU then down_proj as separate dispatches. Fused swiglu+down
+            // kernel (dequant_matvec_8bit_fast_swiglu_down) was tried but gave
+            // no measurable speedup — the intermediate act buffer was already
+            // GPU-local and the "saved" write/read was cheap.
             {
-                id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 [enc setComputePipelineState:g_metal->swiglu];
                 [enc setBuffer:g_metal->buf_shared_gate offset:0 atIndex:0];
                 [enc setBuffer:g_metal->buf_shared_up   offset:0 atIndex:1];
@@ -5700,18 +5889,43 @@ static void fused_layer_forward(
                     threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
                 [enc endEncoding];
             }
-
-            // down_proj: buf_shared_act (INTERMEDIATE_SIZE) -> buf_shared_out (HIDDEN_DIM)
             gpu_encode_dequant_matvec_with_io_bufs(
-                g_metal, cmd_dense, sdw, sds, sdb,
+                g_metal, cmd_fused, sdw, sds, sdb,
                 g_metal->buf_shared_act, g_metal->buf_shared_out,
                 (uint32_t)HIDDEN_DIM, (uint32_t)INTERMEDIATE_SIZE, (uint32_t)GROUP_SIZE,
                 lc->shared_down_bits);
 
-            // residual_add: buf_h_mid + buf_shared_out -> buf_moe_hidden
-            // (this is the new residual stream after the MLP)
-            {
-                id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
+            // Fused residual + next-layer rms norm. For non-last layers we
+            // can do the next-layer norm inline so the next layer's CMD1 can
+            // submit immediately (fast path). For the last layer just do the
+            // residual_add and leave buf_moe_hidden as the final hidden state.
+            int next_norm_fused = (g_metal->residual_rms_norm_fused &&
+                                   g_metal->wf_buf &&
+                                   layer_idx < NUM_LAYERS - 1 &&
+                                   layer_cache[layer_idx + 1].input_norm_w != NULL);
+            int gpu_combine = 1;  // dense always uses the gpu_combined finalize path
+
+            if (next_norm_fused) {
+                uint16_t *next_norm_w = layer_cache[layer_idx + 1].input_norm_w;
+                NSUInteger norm_off = (NSUInteger)((const char *)next_norm_w -
+                                                   (const char *)[g_metal->wf_buf contents]);
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
+                uint32_t dim = HIDDEN_DIM;
+                float eps = RMS_NORM_EPS;
+                [enc setComputePipelineState:g_metal->residual_rms_norm_fused];
+                [enc setBuffer:g_metal->buf_h_mid       offset:0       atIndex:0]; // a
+                [enc setBuffer:g_metal->buf_shared_out  offset:0       atIndex:1]; // b
+                [enc setBuffer:g_metal->buf_moe_hidden  offset:0       atIndex:2]; // h_mid out
+                [enc setBuffer:g_metal->wf_buf          offset:norm_off atIndex:3]; // bf16 w
+                [enc setBuffer:g_metal->buf_input       offset:0       atIndex:4]; // normed out
+                [enc setBytes:&dim length:4 atIndex:5];
+                [enc setBytes:&eps length:4 atIndex:6];
+                [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+                    threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+                [enc endEncoding];
+            } else {
+                // Last layer: just residual_add into buf_moe_hidden.
+                id<MTLComputeCommandEncoder> enc = [cmd_fused computeCommandEncoder];
                 uint32_t dim = HIDDEN_DIM;
                 [enc setComputePipelineState:g_metal->residual_add];
                 [enc setBuffer:g_metal->buf_h_mid       offset:0 atIndex:0];
@@ -5724,78 +5938,46 @@ static void fused_layer_forward(
                 [enc endEncoding];
             }
 
-            // For non-last layers: fuse the next layer's input_norm into this CMD3
-            // so the next layer can skip deferred_wait + CPU norm and submit CMD1
-            // immediately. (Same fast-path trick as the MoE GPU-combine tail.)
-            //
-            // For the LAST layer there's no next-layer norm to fuse. We still
-            // mark `dense_gpu_combined=1` so finalize_deferred_experts() takes
-            // its short gpu_combined path (memcpy buf_moe_hidden -> hidden) —
-            // the alternative CPU-combine path expects MoE-shaped state we
-            // don't have. `next_norm_fused` controls whether the next-layer
-            // input-norm encoders are appended.
-            int next_norm_fused = (g_metal->rms_norm_sum &&
-                                   g_metal->rms_norm_apply_bf16 &&
-                                   g_metal->wf_buf &&
-                                   layer_idx < NUM_LAYERS - 1 &&
-                                   layer_cache[layer_idx + 1].input_norm_w != NULL);
-            int gpu_combine = 1;  // dense always uses the gpu_combined finalize path
+            if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
 
-            if (next_norm_fused) {
-                // rms_norm_sum_sq: buf_moe_hidden -> buf_cmd3_sum_sq
-                {
-                    id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
-                    uint32_t dim = HIDDEN_DIM;
-                    [enc setComputePipelineState:g_metal->rms_norm_sum];
-                    [enc setBuffer:g_metal->buf_moe_hidden  offset:0 atIndex:0];
-                    [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0 atIndex:1];
-                    [enc setBytes:&dim length:4 atIndex:2];
-                    [enc dispatchThreadgroups:MTLSizeMake(1, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
-                // rms_norm_apply_bf16: buf_moe_hidden + next_norm_w -> buf_input
-                {
-                    uint16_t *next_norm_w = layer_cache[layer_idx + 1].input_norm_w;
-                    NSUInteger norm_off = (NSUInteger)((const char *)next_norm_w -
-                                                       (const char *)[g_metal->wf_buf contents]);
-                    id<MTLComputeCommandEncoder> enc = [cmd_dense computeCommandEncoder];
-                    uint32_t dim = HIDDEN_DIM;
-                    float eps = RMS_NORM_EPS;
-                    [enc setComputePipelineState:g_metal->rms_norm_apply_bf16];
-                    [enc setBuffer:g_metal->buf_moe_hidden  offset:0       atIndex:0];
-                    [enc setBuffer:g_metal->wf_buf          offset:norm_off atIndex:1];
-                    [enc setBuffer:g_metal->buf_cmd3_sum_sq offset:0       atIndex:2];
-                    [enc setBuffer:g_metal->buf_input       offset:0       atIndex:3];
-                    [enc setBytes:&dim length:4 atIndex:4];
-                    [enc setBytes:&eps length:4 atIndex:5];
-                    uint32_t tgs = (dim + 255) / 256;
-                    [enc dispatchThreadgroups:MTLSizeMake(tgs, 1, 1)
-                        threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-                    [enc endEncoding];
-                }
+            // ---- Single async commit for BOTH CMD2 and CMD3 encoders. ----
+            // Do NOT wait: the next layer's CMD1 will serialize after this on
+            // the same queue, and finalize_deferred_experts will wait as needed.
+            if (g_timing_enabled) { t0 = now_ms(); }
+            if (g_timing_enabled) {
+                [cmd_fused addCompletedHandler:^(id<MTLCommandBuffer> cb) {
+                    double gpu_ms = (cb.GPUEndTime - cb.GPUStartTime) * 1000.0;
+                    g_timing.cmd_fused_gpu += gpu_ms;
+                }];
             }
-
-            [cmd_dense commit];
+            [cmd_fused commit];
 
             if (g_timing_enabled) {
                 t1 = now_ms();
                 g_timing.cmd2_wait += t1 - t0;
-                g_timing.cmd3_encode += 0;  // negligible
                 g_timing.count++;
                 g_timing.total += t1 - t_layer_start;
             }
 
-            // Save deferred state. finalize_deferred_experts() will read
-            // buf_moe_hidden -> hidden (the residual stream for the next layer).
             g_deferred.active = 1;
             g_deferred.gpu_combined = gpu_combine;
-            g_deferred.cmd_experts = cmd_dense;
+            g_deferred.cmd_experts = cmd_fused;
             g_deferred.actual_K = 0;
             g_deferred.shared_gate_score = 0.0f;
             g_deferred.hidden = hidden;
             g_deferred.layer_idx = layer_idx;
             return;
+        }
+
+        if (g_timing_enabled) { t1 = now_ms(); g_timing.cmd2_encode += t1 - t0; }
+
+        // ---- Single commit+wait for all encoders (MoE only) ----
+        if (g_timing_enabled) { t0 = now_ms(); }
+        [cmd_fused commit];
+        [cmd_fused waitUntilCompleted];
+        if (cmd_fused.error) {
+            fprintf(stderr, "[L%d] CMD2 ERROR: %s\n", layer_idx,
+                    [[cmd_fused.error description] UTF8String]);
         }
 
         // Read back results (MoE only)
